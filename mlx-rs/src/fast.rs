@@ -4,7 +4,7 @@ use std::ffi::CStr;
 
 use crate::error::Result;
 use crate::utils::guard::Guarded;
-use crate::utils::{IntoOption, VectorArray};
+use crate::utils::IntoOption;
 use crate::{Array, Stream};
 use mlx_internal_macros::{default_device, generate_macro};
 
@@ -85,20 +85,26 @@ impl<'a> IntoOption<ScaledDotProductAttentionMask<'a>> for &'a [Array] {
     }
 }
 
+/// The absent value for mlx-c's nullable array parameters: it tests `.ctx` and
+/// substitutes `std::nullopt`. Allocates nothing.
+fn null_array() -> mlx_sys::mlx_array {
+    mlx_sys::mlx_array {
+        ctx: std::ptr::null_mut(),
+    }
+}
+
 impl ScaledDotProductAttentionMask<'_> {
-    fn as_mode_and_masks(&self) -> (&'static CStr, VectorArray) {
+    /// mlx-c 0.6.0 replaced the `mlx_vector_array` of masks with a single
+    /// `mask_arr`, leaving no way to express the `Arrays` variant. It degrades
+    /// to its first element.
+    fn as_mode_and_mask(&self) -> (&'static CStr, mlx_sys::mlx_array) {
         match self {
-            ScaledDotProductAttentionMask::Array(mask) => (
-                DEFAULT_MASK_MODE,
-                VectorArray::try_from_iter([mask].iter()).unwrap(),
-            ),
+            ScaledDotProductAttentionMask::Array(mask) => (DEFAULT_MASK_MODE, mask.as_ptr()),
             ScaledDotProductAttentionMask::Arrays(masks) => (
                 DEFAULT_MASK_MODE,
-                VectorArray::try_from_iter(masks.iter()).unwrap(),
+                masks.first().map(|m| m.as_ptr()).unwrap_or_else(null_array),
             ),
-            ScaledDotProductAttentionMask::Causal => (CAUSAL_MASK_MODE, unsafe {
-                VectorArray::from_ptr(mlx_sys::mlx_vector_array_new())
-            }),
+            ScaledDotProductAttentionMask::Causal => (CAUSAL_MASK_MODE, null_array()),
         }
     }
 }
@@ -122,14 +128,9 @@ pub fn scaled_dot_product_attention_device<'a>(
     #[optional] mask: impl IntoOption<ScaledDotProductAttentionMask<'a>>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
-    let (mask_mode, masks) = mask.into_option().map_or_else(
-        || {
-            (DEFAULT_MASK_MODE, unsafe {
-                VectorArray::from_ptr(mlx_sys::mlx_vector_array_new())
-            })
-        },
-        |m| m.as_mode_and_masks(),
-    );
+    let (mask_mode, mask_arr) = mask
+        .into_option()
+        .map_or_else(|| (DEFAULT_MASK_MODE, null_array()), |m| m.as_mode_and_mask());
 
     Array::try_from_op(|res| unsafe {
         mlx_sys::mlx_fast_scaled_dot_product_attention(
@@ -139,7 +140,9 @@ pub fn scaled_dot_product_attention_device<'a>(
             values.as_ref().as_ptr(),
             scale,
             mask_mode.as_ptr(),
-            masks.as_ptr(),
+            mask_arr,
+            // `sinks`, new in mlx-c 0.6.0: attention sinks, absent here.
+            null_array(),
             stream.as_ref().as_ptr(),
         )
     })

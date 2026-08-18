@@ -1,5 +1,10 @@
 use mlx_internal_macros::{default_device, generate_macro};
 
+// mlx-c 0.6.0 added an explicit normalisation argument to every FFT entry
+// point, immediately before the stream. MLX's default, and what the older
+// signatures did implicitly, is "backward": no scaling forward, 1/n inverse.
+const NORM_BACKWARD: mlx_sys::mlx_fft_norm = mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD;
+
 use crate::{
     error::Result,
     utils::{guard::Guarded, IntoOption},
@@ -30,7 +35,7 @@ pub fn rfft_device(
     let a = a.as_ref();
     let (n, axis) = resolve_size_and_axis_unchecked(a, n.into(), axis.into());
     Array::try_from_op(|res| unsafe {
-        mlx_sys::mlx_fft_rfft(res, a.as_ptr(), n, axis, stream.as_ref().as_ptr())
+        mlx_sys::mlx_fft_rfft(res, a.as_ptr(), n, axis, NORM_BACKWARD, stream.as_ref().as_ptr())
     })
 }
 
@@ -72,6 +77,7 @@ pub fn rfft2_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -115,6 +121,7 @@ pub fn rfftn_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -148,7 +155,7 @@ pub fn irfft_device(
     }
 
     Array::try_from_op(|res| unsafe {
-        mlx_sys::mlx_fft_irfft(res, a.as_ptr(), n, axis, stream.as_ref().as_ptr())
+        mlx_sys::mlx_fft_irfft(res, a.as_ptr(), n, axis, NORM_BACKWARD, stream.as_ref().as_ptr())
     })
 }
 
@@ -198,6 +205,7 @@ pub fn irfft2_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -250,6 +258,7 @@ pub fn irfftn_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })

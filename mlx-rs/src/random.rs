@@ -4,6 +4,7 @@ use crate::ops::indexing::TryIndexOp;
 use crate::utils::guard::Guarded;
 use crate::utils::IntoOption;
 use crate::{error::Result, Array, ArrayElement, Stream};
+#[cfg(target_vendor = "apple")]
 use mach_sys::mach_time;
 use mlx_internal_macros::{default_device, generate_macro};
 use parking_lot::Mutex;
@@ -23,9 +24,27 @@ pub struct RandomState {
     state: Array,
 }
 
+/// A time-derived value to seed the default RNG state with.
+///
+/// `mach_approximate_time` is a Darwin call and is an unresolved external at
+/// final link on windows-msvc. Any clock will do for a seed.
+#[cfg(target_vendor = "apple")]
+fn seed_from_clock() -> u64 {
+    unsafe { mach_time::mach_approximate_time() }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn seed_from_clock() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 impl RandomState {
     fn new() -> Result<Self> {
-        let now = unsafe { mach_time::mach_approximate_time() };
+        let now = seed_from_clock();
         Ok(Self { state: key(now)? })
     }
 

@@ -1,6 +1,37 @@
+use std::ffi::CStr;
+
 use mlx_internal_macros::{default_device, generate_macro};
 
-use crate::{error::Result, utils::guard::Guarded, Array, Stream};
+use crate::{
+    error::{Exception, Result},
+    utils::{guard::Guarded, VectorArray},
+    Array, Stream,
+};
+
+/// mlx-c 0.6.0 made `group_size` and `bits` optional and added a `mode` string.
+/// "affine" is MLX's default and the original scheme.
+const AFFINE_MODE: &CStr = c"affine";
+
+fn opt_int(value: i32) -> mlx_sys::mlx_optional_int {
+    mlx_sys::mlx_optional_int {
+        value,
+        has_value: true,
+    }
+}
+
+/// The absent value for mlx-c's nullable array parameters.
+fn null_array() -> mlx_sys::mlx_array {
+    mlx_sys::mlx_array {
+        ctx: std::ptr::null_mut(),
+    }
+}
+
+fn no_dtype() -> mlx_sys::mlx_optional_dtype {
+    mlx_sys::mlx_optional_dtype {
+        value: 0,
+        has_value: false,
+    }
+}
 
 /// Quantize the matrix `w` using `bits` bits per element.
 ///
@@ -30,17 +61,32 @@ pub fn quantize_device(
     let group_size = group_size.into().unwrap_or(64);
     let bits = bits.into().unwrap_or(4);
 
-    <(Array, Array, Array) as Guarded>::try_from_op(|(res0, res1, res2)| unsafe {
+    // mlx-c 0.6.0 returns one vector rather than three out-parameters, since a
+    // mode may produce a different count. "affine" produces three: packed
+    // weights, scales, biases.
+    let packed = VectorArray::try_from_op(|res| unsafe {
         mlx_sys::mlx_quantize(
-            res0,
-            res1,
-            res2,
+            res,
             w.as_ref().as_ptr(),
-            group_size,
-            bits,
+            opt_int(group_size),
+            opt_int(bits),
+            AFFINE_MODE.as_ptr(),
+            null_array(),
             stream.as_ref().as_ptr(),
         )
-    })
+    })?;
+
+    let mut values: Vec<Array> = packed.try_into_values()?;
+    if values.len() != 3 {
+        return Err(Exception::custom(format!(
+            "mlx_quantize returned {} arrays, expected 3",
+            values.len()
+        )));
+    }
+    let biases = values.pop().unwrap();
+    let scales = values.pop().unwrap();
+    let wq = values.pop().unwrap();
+    Ok((wq, scales, biases))
 }
 
 /// Perform the matrix multiplication with the quantized matrix `w`. The quantization uses one
@@ -71,8 +117,9 @@ pub fn quantized_matmul_device(
             scales.as_ref().as_ptr(),
             biases.as_ref().as_ptr(),
             transpose,
-            group_size,
-            bits,
+            opt_int(group_size),
+            opt_int(bits),
+            AFFINE_MODE.as_ptr(),
             stream.as_ref().as_ptr(),
         )
     })
@@ -102,8 +149,11 @@ pub fn dequantize_device(
             w.as_ref().as_ptr(),
             scales.as_ref().as_ptr(),
             biases.as_ref().as_ptr(),
-            group_size,
-            bits,
+            opt_int(group_size),
+            opt_int(bits),
+            AFFINE_MODE.as_ptr(),
+            null_array(),
+            no_dtype(),
             stream.as_ref().as_ptr(),
         )
     })
