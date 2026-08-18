@@ -43,6 +43,7 @@ targets = [
 
 [features]
 accelerate = []
+cuda = []
 default = [
     "accelerate",
     "metal",
