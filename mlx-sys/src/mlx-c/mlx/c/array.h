@@ -11,7 +11,12 @@
 #include <stdlib.h>
 
 // Complex number support
-#ifdef _MSC_VER
+//
+// Split on compiler, not platform, as half.h does. cl.exe has no _Complex;
+// libclang does. Giving clang _Fcomplex would make bindgen emit MSVC's
+// _C_float_complex instead of its own __BindgenComplex<f32>, which is the type
+// mlx-rs names. Layout-identical (two floats) and only crossed by pointer.
+#if defined(_MSC_VER) && !defined(__clang__)
 #define _CRT_USE_C_COMPLEX_H
 #include <complex.h>
 typedef _Fcomplex mlx_complex64_t;

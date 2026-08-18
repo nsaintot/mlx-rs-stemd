@@ -458,7 +458,11 @@ extern "C" int mlx_array_item_complex64(
     mlx_complex64_t* res,
     const mlx_array arr) {
   try {
-    *res = mlx_array_get_(arr).item<mlx_complex64_t>();
+    // MLX instantiates item<T> for std::complex<float>, never for whatever
+    // spelling of complex the C header picked. Same layout, so copy the bytes.
+    auto v = mlx_array_get_(arr).item<std::complex<float>>();
+    static_assert(sizeof(v) == sizeof(mlx_complex64_t), "complex width mismatch");
+    std::memcpy(res, &v, sizeof(mlx_complex64_t));
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;
@@ -469,7 +473,11 @@ extern "C" int mlx_array_item_complex64(
 #ifdef HAS_FLOAT16
 extern "C" int mlx_array_item_float16(float16_t* res, const mlx_array arr) {
   try {
-    *res = mlx_array_get_(arr).item<float16_t>();
+    /* Off aarch64 the C typedef is a plain 2-byte POD, for which MLX has no
+       explicit instantiation. Name mlx::core's type and copy the bytes. */
+    auto v = mlx_array_get_(arr).item<mlx::core::float16_t>();
+    static_assert(sizeof(v) == sizeof(float16_t), "half width mismatch");
+    std::memcpy(res, &v, sizeof(float16_t));
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;
@@ -481,7 +489,9 @@ extern "C" int mlx_array_item_float16(float16_t* res, const mlx_array arr) {
 #ifdef HAS_BFLOAT16
 extern "C" int mlx_array_item_bfloat16(bfloat16_t* res, const mlx_array arr) {
   try {
-    *res = mlx_array_get_(arr).item<bfloat16_t>();
+    auto v = mlx_array_get_(arr).item<mlx::core::bfloat16_t>();
+    static_assert(sizeof(v) == sizeof(bfloat16_t), "half width mismatch");
+    std::memcpy(res, &v, sizeof(bfloat16_t));
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;
@@ -593,7 +603,8 @@ extern "C" const mlx_complex64_t* mlx_array_data_complex64(
 #ifdef HAS_FLOAT16
 extern "C" const float16_t* mlx_array_data_float16(const mlx_array arr) {
   try {
-    return mlx_array_get_(arr).data<float16_t>();
+    return reinterpret_cast<const float16_t*>(
+        mlx_array_get_(arr).data<mlx::core::float16_t>());
   } catch (std::exception& e) {
     mlx_error(e.what());
     return nullptr;
@@ -604,7 +615,8 @@ extern "C" const float16_t* mlx_array_data_float16(const mlx_array arr) {
 #ifdef HAS_BFLOAT16
 extern "C" const bfloat16_t* mlx_array_data_bfloat16(const mlx_array arr) {
   try {
-    return mlx_array_get_(arr).data<bfloat16_t>();
+    return reinterpret_cast<const bfloat16_t*>(
+        mlx_array_get_(arr).data<mlx::core::bfloat16_t>());
   } catch (std::exception& e) {
     mlx_error(e.what());
     return nullptr;
