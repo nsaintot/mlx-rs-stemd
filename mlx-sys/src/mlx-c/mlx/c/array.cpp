@@ -34,7 +34,7 @@ extern "C" int mlx_array_free(mlx_array arr) {
   return 0;
 }
 
-extern "C" mlx_array mlx_array_new() {
+extern "C" mlx_array mlx_array_new(void) {
   try {
     return mlx_array_();
   } catch (std::exception& e) {
@@ -159,8 +159,7 @@ extern "C" int mlx_array_set_data(
     int dim,
     mlx_dtype dtype) {
   try {
-    std::vector<int> cpp_shape;
-    cpp_shape.assign(shape, shape + dim);
+    mlx::core::Shape cpp_shape(shape, shape + dim);
     mlx::core::Dtype cpp_dtype = mlx_dtype_to_cpp(dtype);
     switch (cpp_dtype) {
       case mlx::core::bool_:
@@ -250,6 +249,35 @@ extern "C" mlx_array mlx_array_new_data(
     mlx_error(e.what());
     return mlx_array_();
   }
+}
+extern "C" mlx_array mlx_array_new_data_managed_payload(
+    void* data,
+    const int* shape,
+    int dim,
+    mlx_dtype dtype,
+    void* payload,
+    void (*dtor)(void*)) {
+  try {
+    mlx::core::Shape cpp_shape(shape, shape + dim);
+    mlx::core::Dtype cpp_dtype = mlx_dtype_to_cpp(dtype);
+    std::function<void(void*)> cpp_deleter = [dtor, payload](void*) {
+      dtor(payload);
+    };
+    return mlx_array_new_(
+        mlx::core::array(data, cpp_shape, cpp_dtype, cpp_deleter));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return mlx_array_();
+  }
+}
+extern "C" mlx_array mlx_array_new_data_managed(
+    void* data,
+    const int* shape,
+    int dim,
+    mlx_dtype dtype,
+    void (*dtor)(void*)) {
+  return mlx_array_new_data_managed_payload(
+      data, shape, dim, dtype, data, dtor);
 }
 
 extern "C" size_t mlx_array_itemsize(const mlx_array arr) {
@@ -427,10 +455,10 @@ extern "C" int mlx_array_item_float64(double* res, const mlx_array arr) {
   return 0;
 }
 extern "C" int mlx_array_item_complex64(
-    float _Complex* res,
+    mlx_complex64_t* res,
     const mlx_array arr) {
   try {
-    *res = mlx_array_get_(arr).item<float _Complex>();
+    *res = mlx_array_get_(arr).item<mlx_complex64_t>();
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;
@@ -550,9 +578,12 @@ extern "C" const double* mlx_array_data_float64(const mlx_array arr) {
     return nullptr;
   }
 }
-extern "C" const float _Complex* mlx_array_data_complex64(const mlx_array arr) {
+extern "C" const mlx_complex64_t* mlx_array_data_complex64(
+    const mlx_array arr) {
   try {
-    return mlx_array_get_(arr).data<float _Complex>();
+    // std::complex<float> and mlx_complex64_t have the same memory layout
+    return reinterpret_cast<const mlx_complex64_t*>(
+        mlx_array_get_(arr).data<std::complex<float>>());
   } catch (std::exception& e) {
     mlx_error(e.what());
     return nullptr;

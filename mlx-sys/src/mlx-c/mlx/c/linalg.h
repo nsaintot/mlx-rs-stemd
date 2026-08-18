@@ -27,6 +27,7 @@ extern "C" {
  * \defgroup linalg Linear algebra operations
  */
 /**@{*/
+
 int mlx_linalg_cholesky(
     mlx_array* res,
     const mlx_array a,
@@ -43,12 +44,18 @@ int mlx_linalg_cross(
     const mlx_array b,
     int axis,
     const mlx_stream s);
+int mlx_linalg_eig(
+    mlx_array* res_0,
+    mlx_array* res_1,
+    const mlx_array a,
+    const mlx_stream s);
 int mlx_linalg_eigh(
     mlx_array* res_0,
     mlx_array* res_1,
     const mlx_array a,
     const char* UPLO,
     const mlx_stream s);
+int mlx_linalg_eigvals(mlx_array* res, const mlx_array a, const mlx_stream s);
 int mlx_linalg_eigvalsh(
     mlx_array* res,
     const mlx_array a,
@@ -111,6 +118,7 @@ int mlx_linalg_tri_inv(
     const mlx_array a,
     bool upper,
     const mlx_stream s);
+
 /**@}*/
 
 #ifdef __cplusplus

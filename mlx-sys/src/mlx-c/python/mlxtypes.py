@@ -32,6 +32,11 @@ for t in [
         "Group",
     ],
     [
+        "mlx_node_namer",
+        "mlx::core::NodeNamer",
+        "NodeNamer",
+    ],
+    [
         "mlx_closure",
         "std::function<std::vector<array>(std::vector<array>)>",
     ],
@@ -54,11 +59,6 @@ for t in [
         "mlx_closure_custom_vmap",
         "std::function<std::pair<std::vector<mlx::core::array>, std::vector<int>>(std::vector<mlx::core::array>,std::vector<int>)>",
         "std::function<std::pair<std::vector<array>, std::vector<int>>(std::vector<array>,std::vector<int>)>",
-    ],
-    [
-        "mlx_closure_metal_kernel",
-        "std::function<std::vector<array>(const std::vector<array>&, const std::vector<std::vector<int>>&, const std::vector<mlx::core::Dtype>&, std::tuple<int, int, int>, std::tuple<int, int, int>, std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>, std::optional<float>, bool, mlx::core::StreamOrDevice)>",
-        "MetalKernelFunction",
     ],
 ]:
     if len(t) == 2:
@@ -151,8 +151,56 @@ def register_raw_vector_type(cpptype, alt=None):
     )
 
 
-register_raw_vector_type("int", alt="Shape")
-register_raw_vector_type("int64_t", alt="Strides")
+def register_small_vector_type(etype, cpptype, alt=None):
+    types.append(
+        {
+            # "c": "mlx_vector_" + cpptype, # DEBUG: ONLY FOR RETURN?
+            "alt": alt,
+            "cpp": cpptype,
+            "free": lambda s: "",
+            "c_to_cpp": lambda s, cpptype=cpptype: cpptype
+            + "("
+            + s
+            + ", "
+            + s
+            + " + "
+            + s
+            + "_num"
+            + ")",
+            "c_assign_from_cpp": lambda d, s, returned=True: d
+            + " = "
+            + s
+            + ".data(); "
+            + d
+            + "_num = "
+            + s
+            + ".size()",
+            "c_arg": lambda s, untyped=False, etype=etype: (
+                (s + ", " + s + "_num")
+                if untyped
+                else ("const " + etype + "* " + s + ", size_t " + s + "_num").strip()
+            ),
+            "c_new": lambda s, etype=etype: "const "
+            + etype
+            + "* "
+            + s
+            + "= nullptr;  size_t "
+            + s
+            + "_num = 0",
+            # "c_return_arg": lambda s, untyped=False, ctype=ctype: (
+            #     ("" if untyped else ctype + " ") + s
+            # ).strip(),
+            # "c_new": lambda s, ctype=ctype: "auto " + s + " = new " + ctype + "_()",
+            "cpp_arg": lambda s, cpptype=cpptype: (
+                "const " + cpptype + "& " + s
+            ).strip(),
+        }
+    )
+
+
+register_small_vector_type("int", "mlx::core::Shape", "Shape")
+register_small_vector_type("int64_t", "mlx::core::Strides", "Strides")
+register_raw_vector_type("int")
 register_raw_vector_type("size_t")
 register_raw_vector_type("uint64_t")
 
@@ -334,6 +382,7 @@ types.append(
 types.append(
     {
         "cpp": "mlx::core::Dtype",
+        "c": "mlx_dtype",
         "alt": "Dtype",
         "c_to_cpp": lambda s: "mlx_dtype_to_cpp(" + s + ")",
         "c_arg": lambda s, untyped=False: s if untyped else "mlx_dtype " + s,
@@ -369,6 +418,22 @@ types.append(
 
 types.append(
     {
+        "cpp": "mlx::core::fft::FFTNorm",
+        "alt": "FFTNorm",
+        "c": "mlx_fft_norm",
+        "c_to_cpp": lambda s: "mlx_fft_norm_to_cpp(" + s + ")",
+        "c_arg": lambda s, untyped=False: s if untyped else "mlx_fft_norm " + s,
+        "c_return_arg": lambda s, untyped=False: (
+            s if untyped else "mlx_fft_norm* " + s
+        ),
+        "c_new": lambda s: "mlx_fft_norm " + s,
+        "free": lambda s: "",
+        "c_assign_from_cpp": lambda d, s: d + " = " + "mlx_fft_norm_to_c(" + s + ")",
+    }
+)
+
+types.append(
+    {
         "cpp": "std::string",
         "alt": "std::string",
         "c_to_cpp": lambda s: "std::string(" + s + ")",
@@ -396,6 +461,16 @@ types.append(
     }
 )
 
+types.append(
+    {
+        "cpp": "std::ostream",
+        "c_to_cpp": lambda s: "CFileOutputStream::as_lvalue(CFileOutputStream("
+        + s
+        + "))",
+        "c_arg": lambda s, untyped=False: s if untyped else "FILE* " + s,
+    }
+)
+
 for ctype in ["int", "size_t", "float", "double", "bool", "uint64_t", "uintptr_t"]:
     types.append(
         {
@@ -414,35 +489,41 @@ for ctype in ["int", "size_t", "float", "double", "bool", "uint64_t", "uintptr_t
     )
 types[-1]["alt"] = "std::uintptr_t"
 
-for ctype in ["float", "int"]:
+for cpptype in ["float", "int", "mlx::core::Dtype"]:
+    typedef = find_cpp_type(cpptype)
+    ctype = typedef["c"]
+    alttype = typedef["alt"]
+
+    opt_ctype = "mlx_optional_" + ctype.replace("mlx_", "")
+    opt_cpptype = "std::optional<" + cpptype + ">"
+    c_to_cpp = typedef["c_to_cpp"] if "c_to_cpp" in typedef else lambda s: s
+    cpp_to_c = typedef["cpp_to_c"] if "cpp_to_c" in typedef else lambda s: s
     types.append(
         {
-            "c": "mlx_optional_" + ctype,
-            "cpp": "std::optional<" + ctype + ">",
-            "alt": None,
+            "c": opt_ctype,
+            "cpp": opt_cpptype,
+            "alt": "std::optional<" + alttype + ">" if alttype else None,
             "free": lambda s: "",
-            "cpp_to_c": lambda s, ctype=ctype: "("
+            "cpp_to_c": lambda s, opt_ctype=opt_ctype, cpp_to_c=cpp_to_c: "("
             + s
-            + ".has_value() ? mlx_optional_"
-            + ctype
+            + ".has_value() ? "
+            + opt_ctype
             + "_"
             + "({"
-            + s
-            + ".value(), true}) : mlx_optional_"
-            + ctype
+            + cpp_to_c(s + ".value()")
+            + ", true}) : "
+            + opt_ctype
             + "_({0, false}))",
-            "c_to_cpp": lambda s, ctype=ctype: "("
+            "c_to_cpp": lambda s, cpptype=cpptype, c_to_cpp=c_to_cpp: "("
             + s
             + ".has_value ? std::make_optional<"
-            + ctype
+            + cpptype
             + ">("
-            + s
-            + ".value) : std::nullopt)",
+            + c_to_cpp(s + ".value")
+            + ") : std::nullopt)",
             "return": lambda s: "return" + s,
-            "c_arg": lambda s, ctype=ctype: ("mlx_optional_" + ctype + " " + s).strip(),
-            "cpp_arg": lambda s, ctype=ctype: (
-                "std::optional<" + ctype + "> " + s
-            ).strip(),
+            "c_arg": lambda s, opt_ctype=opt_ctype: (opt_ctype + " " + s).strip(),
+            "cpp_arg": lambda s, opt_cpptype=opt_cpptype: (opt_cpptype + s).strip(),
         }
     )
 
