@@ -524,6 +524,23 @@ fn link_cuda(is_windows: bool) {
         }
     } else {
         println!("cargo:rustc-link-search=native={}", cuda_path.join("lib64").display());
+        // cuDNN is not part of the CUDA toolkit and is frequently not on the
+        // system linker path either: an unpacked wheel or tarball lives wherever
+        // it was put, and CUDNN_PATH is how this build hears about it. Windows
+        // already added it; without the same here, `-lcudnn` below resolves
+        // against whatever the distribution happens to ship. On Debian 13 that
+        // is 9.0.0, which predates cudnnBackendPopulateCudaGraph, so a build
+        // configured correctly against a newer cuDNN still dies at the final
+        // link with undefined symbols out of cudnn_frontend.
+        if let Ok(cudnn) = env::var("CUDNN_PATH") {
+            let root = PathBuf::from(cudnn);
+            for dir in ["lib", "lib64"] {
+                let path = root.join(dir);
+                if path.is_dir() {
+                    println!("cargo:rustc-link-search=native={}", path.display());
+                }
+            }
+        }
     }
 
     // One entry per target_link_libraries(mlx PRIVATE CUDA::...) in
