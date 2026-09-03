@@ -120,6 +120,13 @@ fn patched_cutlass(out_dir: &Path) -> Option<PathBuf> {
 /// The anchors are matched verbatim, indentation included, so an MLX that has
 /// moved fails the build instead of being patched at the wrong line.
 
+/// Oldest macOS an Apple build of this runs on.
+///
+/// It has to be stated rather than inherited, or the answer is whichever SDK
+/// built the binary and the artefact only works on machines no older than the
+/// one it was built on. See where this is used.
+const MACOS_DEPLOYMENT_TARGET: &str = "14.0";
+
 /// rms_norm.cu:298-301 as v0.31.2 ships it.
 const RMS_BROKEN: &str = r#"  } else if (axis_size <= n_per_thread * 32 * 2) {
     f(std::integral_constant<int, 32>{},
@@ -299,6 +306,45 @@ fn build_and_link_mlx_c() {
         config.define("CMAKE_BUILD_TYPE", "Release");
     }
 
+    if is_apple {
+        // Two halves, and both have to be said or the artefact is still tied to
+        // the machine that built it.
+        //
+        // This one is the C++. cmake-rs derives `-mmacosx-version-min` through
+        // `cc`, which reads this variable and falls back to the SDK's own
+        // version when it is unset, so the objects would otherwise carry the
+        // builder's macOS whatever CMAKE_OSX_DEPLOYMENT_TARGET below says.
+        // Setting it here rather than asking every caller to remember keeps a
+        // plain `cargo build` producing the same floor as a release.
+        //
+        // Sound in a build script: this runs before anything else in the
+        // process and there is no second thread to observe the write.
+        env::set_var("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
+
+        // And this one is the Metal shaders, pinned rather than inherited. MLX
+        // asks the metal compiler instead of deciding:
+        //
+        //   if(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+        //     set(XCRUN_FLAGS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+        //   execute_process(... xcrun -sdk macosx metal ${XCRUN_FLAGS} ...
+        //                   OUTPUT_VARIABLE MLX_METAL_VERSION)
+        //
+        // Left empty the flag is empty too, so the shaders come out built for
+        // whichever SDK the machine doing the building happened to carry, and
+        // MLX_METAL_JIT is OFF, so there is no runtime fallback to a version
+        // the target can load. Meanwhile the Mach-O header keeps its own
+        // `minos`, so the binary launches anywhere and fails only when it first
+        // needs the GPU, well past the point where the log still says what it
+        // was doing.
+        //
+        // That is not hypothetical. The first release was built against a macOS
+        // 26.5 SDK and separated nothing on 26.2, while the same source built
+        // on the reporter's own machine worked.
+        //
+        // 14.0 is MLX's own floor for MLX_BUILD_METAL=ON: it refuses an SDK
+        // below that a few lines above the block quoted here.
+        config.define("CMAKE_OSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
+    }
     config.define("MLX_BUILD_METAL", if metal { "ON" } else { "OFF" });
     config.define("MLX_BUILD_ACCELERATE", if accelerate { "ON" } else { "OFF" });
     config.define("MLX_BUILD_CUDA", if cuda { "ON" } else { "OFF" });
