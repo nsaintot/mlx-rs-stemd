@@ -120,6 +120,25 @@ fn patched_cutlass(out_dir: &Path) -> Option<PathBuf> {
 /// The anchors are matched verbatim, indentation included, so an MLX that has
 /// moved fails the build instead of being patched at the wrong line.
 
+/// The MLX this crate builds. Must track the GIT_TAG of the `mlx`
+/// FetchContent_Declare in src/mlx-c/CMakeLists.txt.
+const MLX_TAG: &str = "v0.31.2";
+
+/// Where a completed build records that every FetchContent dependency is
+/// present in OUT_DIR, so later configures can skip downloading them.
+///
+/// MLX declares CCCL, nlohmann json and metal-cpp as URL archives with no
+/// hash, and FetchContent downloads and re-extracts those on every configure.
+/// Cargo configures again whenever this script reruns, and CMP0135 stamps the
+/// extracted headers with the extraction time, so ninja sees every CUDA kernel
+/// as out of date behind CCCL: about two and a half hours on Windows for an
+/// edit to this file. With the sources already there the population step has
+/// nothing to add, so it is switched off. Named for the MLX tag, because that
+/// tag decides which versions of the dependencies MLX asks for.
+fn fetchcontent_marker(out_dir: &Path) -> PathBuf {
+    out_dir.join(format!("fetchcontent-populated-{MLX_TAG}"))
+}
+
 /// Oldest macOS an Apple build of this runs on.
 ///
 /// It has to be stated rather than inherited, or the answer is whichever SDK
@@ -158,10 +177,6 @@ const RMS_VJP_GUARD: &str = r#"              constexpr int block_dim = group_dim
 "#;
 
 fn patched_mlx(out_dir: &Path) -> PathBuf {
-    // Must track the GIT_TAG of the `mlx` FetchContent_Declare in
-    // src/mlx-c/CMakeLists.txt.
-    const MLX_TAG: &str = "v0.31.2";
-
     let dir = out_dir.join("mlx-rmsnorm");
     let kernel = dir.join("mlx/backend/cuda/rms_norm.cu");
     if !kernel.exists() {
@@ -414,8 +429,20 @@ fn build_and_link_mlx_c() {
         }
     }
 
+    // Stated both ways, ON and OFF: the value lives in CMakeCache.txt between
+    // configures, and an ON left there after the marker went would keep a
+    // cold directory from ever fetching anything.
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let populated = fetchcontent_marker(&out_dir);
+    let warm = populated.exists() && out_dir.join("build/_deps").is_dir();
+    config.define("FETCHCONTENT_FULLY_DISCONNECTED", if warm { "ON" } else { "OFF" });
+
     // build the mlx-c project
     let dst = config.build();
+    // Only reached when cmake succeeded, so everything it fetches is in place.
+    if let Err(e) = fs::write(&populated, "") {
+        println!("cargo:warning=mlx-sys: could not write {}: {e}", populated.display());
+    }
     let build_dir = dst.join("build");
 
     println!("cargo:rustc-link-search=native={}/build/lib", dst.display());
