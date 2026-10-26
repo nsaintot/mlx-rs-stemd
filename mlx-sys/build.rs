@@ -480,7 +480,6 @@ fn build_and_link_mlx_c() {
 
     link_mlx(&lib_dir, Some(&build_dir), is_apple, is_windows, metal, accelerate, cuda);
 
-    // After link_mlx, which compiles the Windows delay-load helper.
     if let Some(out) = env::var_os("MLX_PREBUILT_OUT") {
         assert!(prebuilt_os, "mlx-sys: MLX_PREBUILT_OUT is supported on Linux and Windows only");
         export_prebuilt(&lib_dir, &build_dir, Path::new(&out), &key, is_msvc);
@@ -560,7 +559,7 @@ fn cudnn_version(include: &Path) -> String {
 }
 
 /// Copy the static libraries and the manifest into `out`. On Windows also
-/// OpenBLAS, dlfcn-win32 and the compiled delay-load helper.
+/// OpenBLAS and dlfcn-win32.
 fn export_prebuilt(lib_dir: &Path, build_dir: &Path, out: &Path, key: &str, is_msvc: bool) {
     let lib_out = out.join("lib");
     fs::create_dir_all(&lib_out)
@@ -578,7 +577,6 @@ fn export_prebuilt(lib_dir: &Path, build_dir: &Path, out: &Path, key: &str, is_m
                 .unwrap_or_else(|| panic!("mlx-sys: no {name} under {}", build_dir.display()));
             copy(&from);
         }
-        copy(&PathBuf::from(env::var("OUT_DIR").unwrap()).join("mlx_delayload.lib"));
     } else {
         for name in ["libmlx.a", "libmlxc.a"] {
             copy(&lib_dir.join(name));
@@ -723,7 +721,7 @@ fn link_cuda(is_windows: bool, prebuilt: bool) {
         let mlx_src = out_dir.join("build/_deps/mlx-src");
         let delayload = mlx_src.join("mlx/backend/cuda/delayload.cpp");
         if prebuilt {
-            println!("cargo:rustc-link-lib=static=mlx_delayload");
+            // No helper: the packages put the CUDA DLLs next to the executable.
         } else if delayload.exists() {
             let mut shim = String::new();
             shim.push_str(&format!(
