@@ -292,8 +292,21 @@ fn build_and_link_mlx_c() {
         || matches!(env::var("MLX_BUILD_CUDA").as_deref(), Ok("1") | Ok("ON") | Ok("on")))
         && !is_apple;
 
+    // Everything the prebuilt key and link_cuda read, declared before the
+    // prebuilt branch returns: once a build script prints one rerun line,
+    // cargo reruns it only for the ones it printed.
+    for var in [
+        "MLX_PREBUILT_DIR",
+        "MLX_PREBUILT_OUT",
+        "MLX_CUDA_ARCHITECTURES",
+        "MLX_SKIP_RMSNORM_PATCH",
+        "CUDA_PATH",
+        "CUDNN_PATH",
+        "CXX",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
     let key = prebuilt_key(cuda);
-    println!("cargo:rerun-if-env-changed=MLX_PREBUILT_DIR");
     if let Some(dir) = env::var_os("MLX_PREBUILT_DIR") {
         assert!(target_os == "linux", "mlx-sys: MLX_PREBUILT_DIR is supported on Linux only");
         let dir = PathBuf::from(dir);
@@ -388,7 +401,6 @@ fn build_and_link_mlx_c() {
         // Cherry-pick of upstream a5a684d onto the pinned v0.31.2. Every CUDA
         // build, not just MSVC: the bug is in the kernel, not the toolchain.
         // See `patched_mlx` for what it is and why it is not a version bump.
-        println!("cargo:rerun-if-env-changed=MLX_SKIP_RMSNORM_PATCH");
         if env::var_os("MLX_SKIP_RMSNORM_PATCH").is_none() {
             let dir = patched_mlx(&PathBuf::from(env::var("OUT_DIR").unwrap()));
             config.define("FETCHCONTENT_SOURCE_DIR_MLX", &dir);
@@ -408,14 +420,12 @@ fn build_and_link_mlx_c() {
         // suffixes it appends are `include` and `lib/x64`, so CUDNN_PATH is the
         // root of a toolkit-shaped tree.
         if let Ok(cudnn) = env::var("CUDNN_PATH") {
-            println!("cargo:rerun-if-env-changed=CUDNN_PATH");
             config.define("CUDNN_INCLUDE_PATH", &cudnn);
             config.define("CUDNN_LIBRARY_PATH", &cudnn);
         }
         // Otherwise MLX shells out to __nvcc_device_query, which needs a GPU
         // present at build time.
         if let Ok(arch) = env::var("MLX_CUDA_ARCHITECTURES") {
-            println!("cargo:rerun-if-env-changed=MLX_CUDA_ARCHITECTURES");
             config.define("MLX_CUDA_ARCHITECTURES", arch);
         }
         if is_msvc {
@@ -467,7 +477,6 @@ fn build_and_link_mlx_c() {
     let build_dir = dst.join("build");
     let lib_dir = build_dir.join("lib");
 
-    println!("cargo:rerun-if-env-changed=MLX_PREBUILT_OUT");
     if let Some(out) = env::var_os("MLX_PREBUILT_OUT") {
         assert!(target_os == "linux", "mlx-sys: MLX_PREBUILT_OUT is supported on Linux only");
         export_prebuilt(&lib_dir, Path::new(&out), &key);
@@ -484,17 +493,60 @@ const PREBUILT_MANIFEST: &str = "mlx-prebuilt.txt";
 /// Bump `recipe` when this script changes what goes into libmlx.a without a
 /// change to the crate version or the MLX tag.
 fn prebuilt_key(cuda: bool) -> String {
-    let archs = if cuda {
-        env::var("MLX_CUDA_ARCHITECTURES").unwrap_or_default()
+    let (archs, nvcc, cudnn) = if cuda {
+        let cuda_path = env::var("CUDA_PATH").map(PathBuf::from).unwrap_or_default();
+        let cudnn_path = env::var("CUDNN_PATH").map(PathBuf::from).unwrap_or_default();
+        (
+            env::var("MLX_CUDA_ARCHITECTURES").unwrap_or_default(),
+            tool_version(&cuda_path.join("bin/nvcc"), "release"),
+            cudnn_version(&cudnn_path.join("include")),
+        )
     } else {
-        String::new()
+        Default::default()
     };
     let rmsnorm = cuda && env::var_os("MLX_SKIP_RMSNORM_PATCH").is_none();
+    let cxx = env::var("CXX").unwrap_or_else(|_| "c++".into());
     format!(
-        "recipe 1\nmlx-sys {}\nmlx {MLX_TAG}\ntarget {}\ncuda {cuda}\n\
-         cuda-architectures {archs}\nrmsnorm-patch {rmsnorm}\n",
+        "recipe 2\nmlx-sys {}\nmlx {MLX_TAG}\ntarget {}\ncxx {}\ncuda {cuda}\n\
+         nvcc {nvcc}\ncudnn {cudnn}\ncuda-architectures {archs}\nrmsnorm-patch {rmsnorm}\n",
         env::var("CARGO_PKG_VERSION").unwrap(),
         env::var("TARGET").unwrap(),
+        tool_version(Path::new(&cxx), ""),
+    )
+}
+
+/// The first line of `tool --version` that contains `needle`, or "unknown".
+fn tool_version(tool: &Path, needle: &str) -> String {
+    std::process::Command::new(tool)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find(|l| l.contains(needle))
+                .map(|l| l.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// The cuDNN version from cudnn_version.h under `include`, or "unknown".
+fn cudnn_version(include: &Path) -> String {
+    let Ok(header) = fs::read_to_string(include.join("cudnn_version.h")) else {
+        return "unknown".into();
+    };
+    let field = |name: &str| {
+        header
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    format!(
+        "{}.{}.{}",
+        field("CUDNN_MAJOR"),
+        field("CUDNN_MINOR"),
+        field("CUDNN_PATCHLEVEL")
     )
 }
 
