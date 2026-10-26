@@ -732,7 +732,7 @@ pub enum PadMode {
 }
 
 impl PadMode {
-    unsafe fn as_c_str(&self) -> *const i8 {
+    unsafe fn as_c_str(&self) -> *const std::ffi::c_char {
         static CONSTANT: &[u8] = b"constant\0";
         static EDGE: &[u8] = b"edge\0";
 

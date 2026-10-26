@@ -292,6 +292,27 @@ fn build_and_link_mlx_c() {
         || matches!(env::var("MLX_BUILD_CUDA").as_deref(), Ok("1") | Ok("ON") | Ok("on")))
         && !is_apple;
 
+    let key = prebuilt_key(cuda);
+    println!("cargo:rerun-if-env-changed=MLX_PREBUILT_DIR");
+    if let Some(dir) = env::var_os("MLX_PREBUILT_DIR") {
+        assert!(target_os == "linux", "mlx-sys: MLX_PREBUILT_DIR is supported on Linux only");
+        let dir = PathBuf::from(dir);
+        let manifest = dir.join(PREBUILT_MANIFEST);
+        let found = fs::read_to_string(&manifest)
+            .unwrap_or_else(|e| panic!("mlx-sys: reading {}: {e}", manifest.display()));
+        assert_eq!(
+            found.trim(),
+            key.trim(),
+            "mlx-sys: the prebuilt MLX in {} was built for a different configuration. \
+             Rebuild it, or unset MLX_PREBUILT_DIR to build from source.",
+            dir.display()
+        );
+        println!("cargo:rerun-if-changed={}", manifest.display());
+        println!("cargo:warning=mlx-sys: linking prebuilt MLX from {}", dir.display());
+        link_mlx(&dir.join("lib"), None, is_apple, is_windows, metal, accelerate, cuda);
+        return;
+    }
+
     let mut config = Config::new("src/mlx-c");
     config.very_verbose(true);
     config.define("CMAKE_INSTALL_PREFIX", ".");
@@ -444,8 +465,67 @@ fn build_and_link_mlx_c() {
         println!("cargo:warning=mlx-sys: could not write {}: {e}", populated.display());
     }
     let build_dir = dst.join("build");
+    let lib_dir = build_dir.join("lib");
 
-    println!("cargo:rustc-link-search=native={}/build/lib", dst.display());
+    println!("cargo:rerun-if-env-changed=MLX_PREBUILT_OUT");
+    if let Some(out) = env::var_os("MLX_PREBUILT_OUT") {
+        assert!(target_os == "linux", "mlx-sys: MLX_PREBUILT_OUT is supported on Linux only");
+        export_prebuilt(&lib_dir, Path::new(&out), &key);
+    }
+
+    link_mlx(&lib_dir, Some(&build_dir), is_apple, is_windows, metal, accelerate, cuda);
+}
+
+/// The file in a prebuilt MLX directory that records what it was built for.
+const PREBUILT_MANIFEST: &str = "mlx-prebuilt.txt";
+
+/// What a prebuilt MLX must match to stand in for a build from source.
+///
+/// Bump `recipe` when this script changes what goes into libmlx.a without a
+/// change to the crate version or the MLX tag.
+fn prebuilt_key(cuda: bool) -> String {
+    let archs = if cuda {
+        env::var("MLX_CUDA_ARCHITECTURES").unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let rmsnorm = cuda && env::var_os("MLX_SKIP_RMSNORM_PATCH").is_none();
+    format!(
+        "recipe 1\nmlx-sys {}\nmlx {MLX_TAG}\ntarget {}\ncuda {cuda}\n\
+         cuda-architectures {archs}\nrmsnorm-patch {rmsnorm}\n",
+        env::var("CARGO_PKG_VERSION").unwrap(),
+        env::var("TARGET").unwrap(),
+    )
+}
+
+/// Copy the two static libraries and the manifest into `out`.
+fn export_prebuilt(lib_dir: &Path, out: &Path, key: &str) {
+    let lib_out = out.join("lib");
+    fs::create_dir_all(&lib_out)
+        .unwrap_or_else(|e| panic!("mlx-sys: creating {}: {e}", lib_out.display()));
+    for name in ["libmlx.a", "libmlxc.a"] {
+        let from = lib_dir.join(name);
+        fs::copy(&from, lib_out.join(name))
+            .unwrap_or_else(|e| panic!("mlx-sys: copying {}: {e}", from.display()));
+    }
+    fs::write(out.join(PREBUILT_MANIFEST), key)
+        .unwrap_or_else(|e| panic!("mlx-sys: writing the manifest in {}: {e}", out.display()));
+    println!("cargo:warning=mlx-sys: exported prebuilt MLX to {}", out.display());
+}
+
+/// Emit the link lines for libmlx and libmlxc in `lib_dir` and everything they
+/// depend on. `build_dir` is the CMake build tree, which Windows needs for the
+/// libraries MLX downloads; a prebuilt has none.
+fn link_mlx(
+    lib_dir: &Path,
+    build_dir: Option<&Path>,
+    is_apple: bool,
+    is_windows: bool,
+    metal: bool,
+    accelerate: bool,
+    cuda: bool,
+) {
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
     // GNU ld resolves archives strictly left to right, so the consumer has to
     // be named before the library it consumes. ld64 and link.exe do not care,
     // so this order is the correct one everywhere.
@@ -464,8 +544,9 @@ fn build_and_link_mlx_c() {
         // and gets dlfcn.h from a vendored dlfcn-win32 that it also links
         // PRIVATE. A static archive keeps no record of either, so the final
         // link has to name them itself.
-        link_found(&build_dir, "libopenblas.lib", "OpenBLAS import library");
-        link_found(&build_dir, "dl.lib", "dlfcn-win32");
+        let build_dir = build_dir.expect("a Windows build has a CMake build tree");
+        link_found(build_dir, "libopenblas.lib", "OpenBLAS import library");
+        link_found(build_dir, "dl.lib", "dlfcn-win32");
         // mlx/backend/cpu/device_info.cpp reads the CPU name out of the
         // registry on Windows (RegOpenKeyExA and friends). CMake gets advapi32
         // from its default platform libraries; cargo's link line has no such
