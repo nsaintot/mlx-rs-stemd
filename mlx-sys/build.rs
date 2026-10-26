@@ -306,9 +306,10 @@ fn build_and_link_mlx_c() {
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }
-    let key = prebuilt_key(cuda);
+    let key = prebuilt_key(cuda, is_msvc);
+    let prebuilt_os = target_os == "linux" || is_msvc;
     if let Some(dir) = env::var_os("MLX_PREBUILT_DIR") {
-        assert!(target_os == "linux", "mlx-sys: MLX_PREBUILT_DIR is supported on Linux only");
+        assert!(prebuilt_os, "mlx-sys: MLX_PREBUILT_DIR is supported on Linux and Windows only");
         let dir = PathBuf::from(dir);
         let manifest = dir.join(PREBUILT_MANIFEST);
         let found = fs::read_to_string(&manifest)
@@ -477,12 +478,13 @@ fn build_and_link_mlx_c() {
     let build_dir = dst.join("build");
     let lib_dir = build_dir.join("lib");
 
-    if let Some(out) = env::var_os("MLX_PREBUILT_OUT") {
-        assert!(target_os == "linux", "mlx-sys: MLX_PREBUILT_OUT is supported on Linux only");
-        export_prebuilt(&lib_dir, Path::new(&out), &key);
-    }
-
     link_mlx(&lib_dir, Some(&build_dir), is_apple, is_windows, metal, accelerate, cuda);
+
+    // After link_mlx, which compiles the Windows delay-load helper.
+    if let Some(out) = env::var_os("MLX_PREBUILT_OUT") {
+        assert!(prebuilt_os, "mlx-sys: MLX_PREBUILT_OUT is supported on Linux and Windows only");
+        export_prebuilt(&lib_dir, &build_dir, Path::new(&out), &key, is_msvc);
+    }
 }
 
 /// The file in a prebuilt MLX directory that records what it was built for.
@@ -492,26 +494,33 @@ const PREBUILT_MANIFEST: &str = "mlx-prebuilt.txt";
 ///
 /// Bump `recipe` when this script changes what goes into libmlx.a without a
 /// change to the crate version or the MLX tag.
-fn prebuilt_key(cuda: bool) -> String {
+fn prebuilt_key(cuda: bool, is_msvc: bool) -> String {
     let (archs, nvcc, cudnn) = if cuda {
         let cuda_path = env::var("CUDA_PATH").map(PathBuf::from).unwrap_or_default();
         let cudnn_path = env::var("CUDNN_PATH").map(PathBuf::from).unwrap_or_default();
+        let nvcc = format!("bin/nvcc{}", env::consts::EXE_SUFFIX);
         (
             env::var("MLX_CUDA_ARCHITECTURES").unwrap_or_default(),
-            tool_version(&cuda_path.join("bin/nvcc"), "release"),
+            tool_version(&cuda_path.join(nvcc), "release"),
             cudnn_version(&cudnn_path.join("include")),
         )
     } else {
         Default::default()
     };
     let rmsnorm = cuda && env::var_os("MLX_SKIP_RMSNORM_PATCH").is_none();
-    let cxx = env::var("CXX").unwrap_or_else(|_| "c++".into());
+    // MSVC 14.x toolsets link libraries built by an older 14.x, and hosted
+    // runners update theirs every month, so only the family is recorded.
+    let cxx = if is_msvc {
+        "msvc".to_string()
+    } else {
+        tool_version(Path::new(&env::var("CXX").unwrap_or_else(|_| "c++".into())), "")
+    };
     format!(
         "recipe 2\nmlx-sys {}\nmlx {MLX_TAG}\ntarget {}\ncxx {}\ncuda {cuda}\n\
          nvcc {nvcc}\ncudnn {cudnn}\ncuda-architectures {archs}\nrmsnorm-patch {rmsnorm}\n",
         env::var("CARGO_PKG_VERSION").unwrap(),
         env::var("TARGET").unwrap(),
-        tool_version(Path::new(&cxx), ""),
+        cxx,
     )
 }
 
@@ -550,15 +559,30 @@ fn cudnn_version(include: &Path) -> String {
     )
 }
 
-/// Copy the two static libraries and the manifest into `out`.
-fn export_prebuilt(lib_dir: &Path, out: &Path, key: &str) {
+/// Copy the static libraries and the manifest into `out`. On Windows also
+/// OpenBLAS, dlfcn-win32 and the compiled delay-load helper.
+fn export_prebuilt(lib_dir: &Path, build_dir: &Path, out: &Path, key: &str, is_msvc: bool) {
     let lib_out = out.join("lib");
     fs::create_dir_all(&lib_out)
         .unwrap_or_else(|e| panic!("mlx-sys: creating {}: {e}", lib_out.display()));
-    for name in ["libmlx.a", "libmlxc.a"] {
-        let from = lib_dir.join(name);
-        fs::copy(&from, lib_out.join(name))
+    let copy = |from: &Path| {
+        fs::copy(from, lib_out.join(from.file_name().unwrap()))
             .unwrap_or_else(|e| panic!("mlx-sys: copying {}: {e}", from.display()));
+    };
+    if is_msvc {
+        for name in ["mlx.lib", "mlxc.lib"] {
+            copy(&lib_dir.join(name));
+        }
+        for name in ["libopenblas.lib", "libopenblas.dll", "dl.lib"] {
+            let from = find_file(build_dir, name)
+                .unwrap_or_else(|| panic!("mlx-sys: no {name} under {}", build_dir.display()));
+            copy(&from);
+        }
+        copy(&PathBuf::from(env::var("OUT_DIR").unwrap()).join("mlx_delayload.lib"));
+    } else {
+        for name in ["libmlx.a", "libmlxc.a"] {
+            copy(&lib_dir.join(name));
+        }
     }
     fs::write(out.join(PREBUILT_MANIFEST), key)
         .unwrap_or_else(|e| panic!("mlx-sys: writing the manifest in {}: {e}", out.display()));
@@ -567,7 +591,7 @@ fn export_prebuilt(lib_dir: &Path, out: &Path, key: &str) {
 
 /// Emit the link lines for libmlx and libmlxc in `lib_dir` and everything they
 /// depend on. `build_dir` is the CMake build tree, which Windows needs for the
-/// libraries MLX downloads; a prebuilt has none.
+/// libraries MLX downloads; a prebuilt keeps those in `lib_dir`.
 fn link_mlx(
     lib_dir: &Path,
     build_dir: Option<&Path>,
@@ -596,9 +620,10 @@ fn link_mlx(
         // and gets dlfcn.h from a vendored dlfcn-win32 that it also links
         // PRIVATE. A static archive keeps no record of either, so the final
         // link has to name them itself.
-        let build_dir = build_dir.expect("a Windows build has a CMake build tree");
-        link_found(build_dir, "libopenblas.lib", "OpenBLAS import library");
-        link_found(build_dir, "dl.lib", "dlfcn-win32");
+        // A prebuilt keeps them beside libmlx.
+        let root = build_dir.unwrap_or(lib_dir);
+        link_found(root, "libopenblas.lib", "OpenBLAS import library");
+        link_found(root, "dl.lib", "dlfcn-win32");
         // mlx/backend/cpu/device_info.cpp reads the CPU name out of the
         // registry on Windows (RegOpenKeyExA and friends). CMake gets advapi32
         // from its default platform libraries; cargo's link line has no such
@@ -622,7 +647,7 @@ fn link_mlx(
     }
 
     if cuda {
-        link_cuda(is_windows);
+        link_cuda(is_windows, build_dir.is_none());
     }
 }
 
@@ -630,7 +655,8 @@ fn link_mlx(
 /// the consumer a translation unit and a pile of linker options as CMake
 /// *usage requirements*. cargo consumes a static archive and emits its own link
 /// line, so it never sees any of that. Reproduce it here.
-fn link_cuda(is_windows: bool) {
+/// `prebuilt` links the delay-load helper compiled with the prebuilt MLX.
+fn link_cuda(is_windows: bool, prebuilt: bool) {
     let cuda_path = env::var("CUDA_PATH")
         .map(PathBuf::from)
         .expect("CUDA_PATH must be set to build with the cuda feature");
@@ -696,7 +722,9 @@ fn link_cuda(is_windows: bool) {
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
         let mlx_src = out_dir.join("build/_deps/mlx-src");
         let delayload = mlx_src.join("mlx/backend/cuda/delayload.cpp");
-        if delayload.exists() {
+        if prebuilt {
+            println!("cargo:rustc-link-lib=static=mlx_delayload");
+        } else if delayload.exists() {
             let mut shim = String::new();
             shim.push_str(&format!(
                 "#define MLX_CUDA_BIN_DIR \"{}\"\n",
