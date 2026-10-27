@@ -341,17 +341,207 @@ bool is_available() {
 }
 "#;
 
+/// event.cu: the `Event` behind every stream, CPU streams included.
+const EVENT_IMPL: &str = r##"  std::unique_ptr<cu::CopyableCudaEvent> cuda;
+  std::unique_ptr<cu::AtomicEvent> atomic;
+
+  bool is_created() const {
+    return cuda || atomic;
+  }
+"##;
+const EVENT_IMPL_PATCHED: &str = r##"  std::unique_ptr<cu::CopyableCudaEvent> cuda;
+  std::unique_ptr<cu::AtomicEvent> atomic;
+
+  // Patched in by mlx-sys: without a CUDA device, a host counter like the
+  // CPU-only build's.
+  struct Host {
+    uint64_t value{0};
+    std::mutex mtx;
+    std::condition_variable cv;
+  };
+  std::unique_ptr<Host> host;
+
+  bool is_created() const {
+    return cuda || atomic || host;
+  }
+"##;
+
+const EVENT_NEW: &str = r##"Event::Event(Stream s) : stream_(s) {
+  event_ = std::shared_ptr<void>(
+      new EventImpl(), [](void* ptr) { delete static_cast<EventImpl*>(ptr); });
+}
+"##;
+const EVENT_NEW_PATCHED: &str = r##"Event::Event(Stream s) : stream_(s) {
+  auto* impl = new EventImpl();
+  static bool no_device = gpu::device_count() == 0;
+  if (no_device) {
+    impl->host = std::make_unique<EventImpl::Host>();
+  }
+  event_ = std::shared_ptr<void>(
+      impl, [](void* ptr) { delete static_cast<EventImpl*>(ptr); });
+}
+"##;
+
+const EVENT_WAIT: &str = r##"void Event::wait() {
+  auto* event = static_cast<EventImpl*>(event_.get());
+  assert(event->is_created());
+"##;
+const EVENT_WAIT_PATCHED: &str = r##"void Event::wait() {
+  auto* event = static_cast<EventImpl*>(event_.get());
+  assert(event->is_created());
+  if (auto* host = event->host.get()) {
+    auto target = value();
+    std::unique_lock lk(host->mtx);
+    host->cv.wait(lk, [host, target] { return host->value >= target; });
+    return;
+  }
+"##;
+
+const EVENT_WAIT_STREAM: &str = r##"void Event::wait(Stream s) {
+  auto* event = static_cast<EventImpl*>(event_.get());
+  assert(event->is_created());
+"##;
+const EVENT_WAIT_STREAM_PATCHED: &str = r##"void Event::wait(Stream s) {
+  auto* event = static_cast<EventImpl*>(event_.get());
+  assert(event->is_created());
+  if (event->host) {
+    scheduler::enqueue(s, [*this]() mutable { wait(); });
+    return;
+  }
+"##;
+
+const EVENT_SIGNAL: &str = r##"void Event::signal(Stream s) {
+  auto* event = static_cast<EventImpl*>(event_.get());
+  event->ensure_created(s, value());
+"##;
+const EVENT_SIGNAL_PATCHED: &str = r##"void Event::signal(Stream s) {
+  auto* event = static_cast<EventImpl*>(event_.get());
+  if (event->host) {
+    scheduler::enqueue(s, [*this]() mutable {
+      auto* host = static_cast<EventImpl*>(event_.get())->host.get();
+      {
+        std::lock_guard lk(host->mtx);
+        host->value = value();
+      }
+      host->cv.notify_all();
+    });
+    return;
+  }
+  event->ensure_created(s, value());
+"##;
+
+const EVENT_SIGNALED: &str = r##"bool Event::is_signaled() const {
+  auto* event = static_cast<EventImpl*>(event_.get());
+"##;
+const EVENT_SIGNALED_PATCHED: &str = r##"bool Event::is_signaled() const {
+  auto* event = static_cast<EventImpl*>(event_.get());
+  if (auto* host = event->host.get()) {
+    std::lock_guard lk(host->mtx);
+    return host->value >= value();
+  }
+"##;
+
+const EVENT_INCLUDES: &str = "#include <map>\n#include <vector>\n";
+const EVENT_INCLUDES_PATCHED: &str =
+    "#include <condition_variable>\n#include <map>\n#include <mutex>\n#include <vector>\n";
+
+/// fence.cpp: the cross-stream `Fence` used by `eval`.
+const FENCE: &str = r##"#include "mlx/backend/cuda/event.h"
+
+namespace mlx::core {
+
+struct FenceImpl {
+  uint32_t count;
+  cu::AtomicEvent event;
+};
+
+Fence::Fence(Stream s) {
+  fence_ = std::shared_ptr<void>(
+      new FenceImpl{0, cu::device(s.device)},
+      [](void* ptr) { delete static_cast<FenceImpl*>(ptr); });
+}
+
+void Fence::wait(Stream s, const array&) {
+  auto* fence = static_cast<FenceImpl*>(fence_.get());
+  fence->event.wait(fence->count);
+}
+
+void Fence::update(Stream s, const array& a, bool cross_device) {
+  auto* fence = static_cast<FenceImpl*>(fence_.get());
+"##;
+const FENCE_PATCHED: &str = r##"#include "mlx/backend/cuda/event.h"
+#include "mlx/backend/gpu/device_info.h"
+#include "mlx/scheduler.h"
+
+#include <condition_variable>
+#include <mutex>
+#include <optional>
+
+namespace mlx::core {
+
+struct FenceImpl {
+  uint32_t count;
+  std::optional<cu::AtomicEvent> event;
+  // Patched in by mlx-sys: without a CUDA device, a host counter like the
+  // CPU-only build's.
+  uint32_t value{0};
+  std::mutex mtx;
+  std::condition_variable cv;
+};
+
+Fence::Fence(Stream s) {
+  auto* impl = new FenceImpl{0};
+  if (gpu::device_count() > 0) {
+    impl->event.emplace(cu::device(s.device));
+  }
+  fence_ = std::shared_ptr<void>(
+      impl, [](void* ptr) { delete static_cast<FenceImpl*>(ptr); });
+}
+
+void Fence::wait(Stream s, const array&) {
+  auto* fence = static_cast<FenceImpl*>(fence_.get());
+  if (!fence->event) {
+    scheduler::enqueue(s, [count = fence->count, fence_ = fence_]() {
+      auto& f = *static_cast<FenceImpl*>(fence_.get());
+      std::unique_lock lk(f.mtx);
+      f.cv.wait(lk, [&f, count] { return f.value >= count; });
+    });
+    return;
+  }
+  fence->event->wait(fence->count);
+}
+
+void Fence::update(Stream s, const array& a, bool cross_device) {
+  auto* fence = static_cast<FenceImpl*>(fence_.get());
+  if (!fence->event) {
+    fence->count++;
+    scheduler::enqueue(s, [count = fence->count, fence_ = fence_]() {
+      auto& f = *static_cast<FenceImpl*>(fence_.get());
+      {
+        std::lock_guard lk(f.mtx);
+        f.value = count;
+      }
+      f.cv.notify_all();
+    });
+    return;
+  }
+"##;
+
+const FENCE_SIGNAL: &str = "  fence->event.signal(s, fence->count);\n";
+const FENCE_SIGNAL_PATCHED: &str = "  fence->event->signal(s, fence->count);\n";
+
 /// Let a CUDA build of MLX run on the CPU of a machine without a CUDA device.
 ///
-/// MLX's CUDA allocator serves CPU arrays too. Its constructor calls
-/// `cudaMemGetInfo` and it allocates with `cudaMallocManaged`, so without a
-/// device every array comes back empty. After this patch `gpu::is_available()`
-/// answers whether a device exists, which makes the CPU MLX's default device,
-/// and the allocator takes host memory from `malloc` in that case.
+/// A CUDA build serves CPU arrays and CPU streams through CUDA too: the
+/// allocator calls `cudaMemGetInfo` and `cudaMallocManaged`, and every `Event`
+/// and `Fence` is built on device 0. Without a device each of these fails.
+/// After this patch `gpu::is_available()` answers whether a device exists,
+/// which makes the CPU MLX's default device, and in that case the allocator
+/// uses `malloc` and events and fences use the CPU-only build's host counter.
 ///
 /// Anchors are matched verbatim, like the RMSNorm ones.
 fn patch_no_device(dir: &Path) {
-    let files: [(&str, &[(&str, &str)]); 2] = [
+    let files: [(&str, &[(&str, &str)]); 4] = [
         (
             "mlx/backend/cuda/allocator.cpp",
             &[
@@ -362,6 +552,19 @@ fn patch_no_device(dir: &Path) {
             ],
         ),
         ("mlx/backend/cuda/device_info.cpp", &[(GPU_AVAILABLE, GPU_AVAILABLE_PATCHED)]),
+        (
+            "mlx/backend/cuda/event.cu",
+            &[
+                (EVENT_INCLUDES, EVENT_INCLUDES_PATCHED),
+                (EVENT_IMPL, EVENT_IMPL_PATCHED),
+                (EVENT_NEW, EVENT_NEW_PATCHED),
+                (EVENT_WAIT, EVENT_WAIT_PATCHED),
+                (EVENT_WAIT_STREAM, EVENT_WAIT_STREAM_PATCHED),
+                (EVENT_SIGNAL, EVENT_SIGNAL_PATCHED),
+                (EVENT_SIGNALED, EVENT_SIGNALED_PATCHED),
+            ],
+        ),
+        ("mlx/backend/cuda/fence.cpp", &[(FENCE, FENCE_PATCHED), (FENCE_SIGNAL, FENCE_SIGNAL_PATCHED)]),
     ];
     for (file, edits) in files {
         let path = dir.join(file);
@@ -635,7 +838,7 @@ fn prebuilt_key(cuda: bool, is_msvc: bool) -> String {
         tool_version(Path::new(&env::var("CXX").unwrap_or_else(|_| "c++".into())), "")
     };
     format!(
-        "recipe 3\nmlx-sys {}\nmlx {MLX_TAG}\ntarget {}\ncxx {}\ncuda {cuda}\n\
+        "recipe 4\nmlx-sys {}\nmlx {MLX_TAG}\ntarget {}\ncxx {}\ncuda {cuda}\n\
          nvcc {nvcc}\ncudnn {cudnn}\ncuda-architectures {archs}\nrmsnorm-patch {rmsnorm}\n",
         env::var("CARGO_PKG_VERSION").unwrap(),
         env::var("TARGET").unwrap(),
