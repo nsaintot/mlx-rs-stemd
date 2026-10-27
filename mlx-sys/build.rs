@@ -226,6 +226,7 @@ fn patched_mlx(out_dir: &Path) -> PathBuf {
 
     // Idempotent: a warm OUT_DIR already holds the patched file.
     if src.contains(RMS_FIXED) && src.contains(RMS_FWD_GUARD) && src.contains(RMS_VJP_GUARD) {
+        patch_no_device(&dir);
         return dir;
     }
 
@@ -264,7 +265,126 @@ fn patched_mlx(out_dir: &Path) -> PathBuf {
         kernel.display()
     );
     println!("cargo:warning=mlx-sys: applied CUDA RMSNorm fix (upstream a5a684d) to {}", kernel.display());
+    patch_no_device(&dir);
     dir
+}
+
+/// allocator.cpp: `std::malloc` and `std::free`.
+const ALLOC_INCLUDE: &str = "#include <cassert>\n";
+const ALLOC_INCLUDE_PATCHED: &str = "#include <cassert>\n#include <cstdlib>\n";
+
+/// allocator.cpp: host buffers come from the C heap when CUDA has no device.
+const ALLOC_MALLOC: &str = r#"inline void* unified_malloc(size_t size) {
+  void* data = nullptr;
+"#;
+const ALLOC_MALLOC_PATCHED: &str = r#"// Patched in by mlx-sys: without a CUDA device, host buffers come from the
+// C heap so the CPU backend still works.
+bool has_cuda_device() {
+  static bool found = gpu::is_available();
+  return found;
+}
+
+inline void* unified_malloc(size_t size) {
+  void* data = nullptr;
+  if (!has_cuda_device()) {
+    return std::malloc(size);
+  }
+"#;
+
+const ALLOC_FREE: &str = r#"inline void unified_free(void* data) {
+"#;
+const ALLOC_FREE_PATCHED: &str = r#"inline void unified_free(void* data) {
+  if (!has_cuda_device()) {
+    std::free(data);
+    return;
+  }
+"#;
+
+/// allocator.cpp, in the `CudaAllocator` constructor.
+const ALLOC_LIMITS: &str = r#"  size_t free;
+  CHECK_CUDA_ERROR(cudaMemGetInfo(&free, &total_memory_));
+  memory_limit_ = total_memory_ * 0.95;
+  free_limit_ = total_memory_ - memory_limit_;
+  max_pool_size_ = memory_limit_;
+"#;
+const ALLOC_LIMITS_PATCHED: &str = r#"  size_t free;
+  if (has_cuda_device()) {
+    CHECK_CUDA_ERROR(cudaMemGetInfo(&free, &total_memory_));
+  } else {
+    // The CPU-only allocator's limit when the RAM size is unknown.
+    total_memory_ = size_t(1) << 33;
+  }
+  memory_limit_ = total_memory_ * 0.95;
+  free_limit_ = total_memory_ - memory_limit_;
+  // Without a device, freed host buffers go straight back to the heap.
+  max_pool_size_ = has_cuda_device() ? memory_limit_ : 0;
+"#;
+
+/// device_info.cpp: `gpu::is_available()` is `true` in every CUDA build.
+const GPU_AVAILABLE: &str = r#"bool is_available() {
+  return true;
+}
+
+int device_count() {
+  int count = 0;
+  cudaGetDeviceCount(&count);
+  return count;
+}
+"#;
+const GPU_AVAILABLE_PATCHED: &str = r#"int device_count() {
+  int count = 0;
+  return cudaGetDeviceCount(&count) == cudaSuccess ? count : 0;
+}
+
+bool is_available() {
+  return device_count() > 0;
+}
+"#;
+
+/// Let a CUDA build of MLX run on the CPU of a machine without a CUDA device.
+///
+/// MLX's CUDA allocator serves CPU arrays too. Its constructor calls
+/// `cudaMemGetInfo` and it allocates with `cudaMallocManaged`, so without a
+/// device every array comes back empty. After this patch `gpu::is_available()`
+/// answers whether a device exists, which makes the CPU MLX's default device,
+/// and the allocator takes host memory from `malloc` in that case.
+///
+/// Anchors are matched verbatim, like the RMSNorm ones.
+fn patch_no_device(dir: &Path) {
+    let files: [(&str, &[(&str, &str)]); 2] = [
+        (
+            "mlx/backend/cuda/allocator.cpp",
+            &[
+                (ALLOC_INCLUDE, ALLOC_INCLUDE_PATCHED),
+                (ALLOC_MALLOC, ALLOC_MALLOC_PATCHED),
+                (ALLOC_FREE, ALLOC_FREE_PATCHED),
+                (ALLOC_LIMITS, ALLOC_LIMITS_PATCHED),
+            ],
+        ),
+        ("mlx/backend/cuda/device_info.cpp", &[(GPU_AVAILABLE, GPU_AVAILABLE_PATCHED)]),
+    ];
+    for (file, edits) in files {
+        let path = dir.join(file);
+        let src = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("mlx-sys: reading {}: {e}", path.display()))
+            .replace("\r\n", "\n");
+        if edits.iter().all(|(_, to)| src.contains(to)) {
+            continue;
+        }
+        let mut out = src;
+        for (from, to) in edits {
+            assert_eq!(
+                out.matches(from).count(),
+                1,
+                "mlx-sys: no unique anchor for the no-device patch in {}; MLX has moved",
+                path.display()
+            );
+            out = out.replacen(from, to, 1);
+        }
+        fs::write(&path, &out)
+            .unwrap_or_else(|e| panic!("mlx-sys: writing {}: {e}", path.display()));
+        println!("cargo:warning=mlx-sys: applied the no-device CPU fallback to {}", path.display());
+    }
 }
 
 fn build_and_link_mlx_c() {
@@ -515,7 +635,7 @@ fn prebuilt_key(cuda: bool, is_msvc: bool) -> String {
         tool_version(Path::new(&env::var("CXX").unwrap_or_else(|_| "c++".into())), "")
     };
     format!(
-        "recipe 2\nmlx-sys {}\nmlx {MLX_TAG}\ntarget {}\ncxx {}\ncuda {cuda}\n\
+        "recipe 3\nmlx-sys {}\nmlx {MLX_TAG}\ntarget {}\ncxx {}\ncuda {cuda}\n\
          nvcc {nvcc}\ncudnn {cudnn}\ncuda-architectures {archs}\nrmsnorm-patch {rmsnorm}\n",
         env::var("CARGO_PKG_VERSION").unwrap(),
         env::var("TARGET").unwrap(),
