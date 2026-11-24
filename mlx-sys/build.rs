@@ -165,6 +165,7 @@ fn patched_mlx(out_dir: &Path) -> PathBuf {
         );
     }
     patch_no_device(&dir);
+    patch_ptx_cache(&dir);
     dir
 }
 
@@ -428,6 +429,66 @@ fn patch_no_device(dir: &Path) {
             ),
         ],
         "no-device CPU fallback",
+    );
+}
+
+/// jit_module.cpp: the end of the anonymous namespace, before `JitModule`.
+const JIT_ARCH_DIR: &str = "} // namespace\n\nJitModule::JitModule(\n";
+const JIT_ARCH_DIR_PATCHED: &str = r#"// Patched in by mlx-sys: a cubin runs on one architecture only, so each one
+// gets its own directory.
+std::filesystem::path arch_cache_dir(Device& device) {
+  const auto& base = ptx_cache_dir();
+  if (base.empty()) {
+    return base;
+  }
+  auto dir = base /
+      fmt::format("sm_{}{}",
+                  device.compute_capability_major(),
+                  device.compute_capability_minor());
+  std::error_code error;
+  std::filesystem::create_directories(dir, error);
+  return error ? std::filesystem::path() : dir;
+}
+
+} // namespace
+
+JitModule::JitModule(
+"#;
+
+const JIT_READ: &str = r#"  // Try to load them from the file cache
+  if (!read_cached_ptx(ptx_cache_dir(), module_name, ptx, ptx_kernels)) {
+"#;
+const JIT_READ_PATCHED: &str = r#"  // Try to load them from the file cache
+  auto cache_dir = arch_cache_dir(device);
+  if (!read_cached_ptx(cache_dir, module_name, ptx, ptx_kernels)) {
+"#;
+
+const JIT_WRITE: &str = r#"      write_cached_ptx(
+          ptx_cache_dir(), module_name, ptx, ptx_kernels, source_code);
+"#;
+const JIT_WRITE_PATCHED: &str = r#"      write_cached_ptx(
+          cache_dir, module_name, ptx, ptx_kernels, source_code);
+"#;
+
+/// Key MLX's on-disk kernel cache by GPU architecture.
+///
+/// MLX caches each JIT-compiled cubin under its kernel name alone, in a
+/// directory shared by every GPU of the machine, so a GPU of another
+/// architecture loads a cubin it cannot run and fails with
+/// `Failed to load compiled <kernel> kernel`. After this patch the cache has
+/// one `sm_<major><minor>` directory per architecture.
+fn patch_ptx_cache(dir: &Path) {
+    apply(
+        dir,
+        &[(
+            "mlx/backend/cuda/jit_module.cpp",
+            &[
+                (JIT_ARCH_DIR, JIT_ARCH_DIR_PATCHED),
+                (JIT_READ, JIT_READ_PATCHED),
+                (JIT_WRITE, JIT_WRITE_PATCHED),
+            ],
+        )],
+        "kernel cache",
     );
 }
 

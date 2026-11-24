@@ -73,8 +73,8 @@ A first build compiles MLX and CUTLASS from source. Budget forty minutes.
 - CUTLASS does not compile under MSVC 19.44 at any released version, v4.4.2
   through v4.7.0 (`cute/stride.hpp:299`, error C3545). `build.rs` renames the
   colliding alias.
-- `build.rs` patches MLX's CUDA backend with a CPU fallback for machines
-  without a CUDA device.
+- `build.rs` patches MLX's CUDA backend: a CPU fallback for machines without
+  a CUDA device, and a kernel cache directory per GPU architecture.
 
 ## Upstreaming
 
