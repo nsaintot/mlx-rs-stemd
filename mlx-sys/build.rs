@@ -168,6 +168,7 @@ fn patched_mlx(out_dir: &Path) -> PathBuf {
     patch_no_cusolver(&dir);
     patch_tma_on_windows(&dir);
     patch_ptx_cache(&dir);
+    patch_host_cache(&dir);
     dir
 }
 
@@ -623,6 +624,104 @@ fn patch_ptx_cache(dir: &Path) {
     );
 }
 
+/// allocator.h: the second cache and its helpers.
+const ALLOC_H_CACHE: &str = "  BufferCache<CudaBuffer> buffer_cache_;\n";
+const ALLOC_H_CACHE_PATCHED: &str =
+    "  BufferCache<CudaBuffer> buffer_cache_;\n  BufferCache<CudaBuffer> host_cache_;\n";
+const ALLOC_H_HELPERS: &str = "  void free_cuda_buffer(CudaBuffer* buf);\n";
+const ALLOC_H_HELPERS_PATCHED: &str = r#"  void free_cuda_buffer(CudaBuffer* buf);
+  BufferCache<CudaBuffer>& cache_for(int device);
+  void release_cached(size_t bytes);
+"#;
+
+/// allocator.cpp: the `CudaAllocator` constructor's initializer list.
+const ALLOC_CTOR: &str = r#"    : buffer_cache_(
+          page_size,
+          [](CudaBuffer* buf) { return buf->size; },
+          [this](CudaBuffer* buf) { free_cuda_buffer(buf); }) {
+"#;
+const ALLOC_CTOR_PATCHED: &str = r#"    : buffer_cache_(
+          page_size,
+          [](CudaBuffer* buf) { return buf->size; },
+          [this](CudaBuffer* buf) { free_cuda_buffer(buf); }),
+      host_cache_(
+          page_size,
+          [](CudaBuffer* buf) { return buf->size; },
+          [this](CudaBuffer* buf) { free_cuda_buffer(buf); }) {
+"#;
+const ALLOC_REUSE: &str = "  CudaBuffer* buf = buffer_cache_.reuse_from_cache(size);\n";
+const ALLOC_REUSE_PATCHED: &str = "  CudaBuffer* buf = cache_for(device).reuse_from_cache(size);\n";
+const ALLOC_PRESSURE: &str = "      buffer_cache_.release_cached_buffers(mem_to_free);\n";
+const ALLOC_PRESSURE_PATCHED: &str = "      release_cached(mem_to_free);\n";
+const ALLOC_TRIM: &str =
+    "    buffer_cache_.release_cached_buffers(get_cache_memory() - max_pool_size_);\n";
+const ALLOC_TRIM_PATCHED: &str = "    release_cached(get_cache_memory() - max_pool_size_);\n";
+const ALLOC_RECYCLE: &str = "    buffer_cache_.recycle_to_cache(buf);\n";
+const ALLOC_RECYCLE_PATCHED: &str = "    cache_for(buf->device).recycle_to_cache(buf);\n";
+const ALLOC_CACHE_SIZE: &str = "  return buffer_cache_.cache_size();\n";
+const ALLOC_CACHE_SIZE_PATCHED: &str =
+    "  return buffer_cache_.cache_size() + host_cache_.cache_size();\n";
+const ALLOC_CLEAR: &str = "    buffer_cache_.clear();\n";
+const ALLOC_CLEAR_PATCHED: &str = "    buffer_cache_.clear();\n    host_cache_.clear();\n";
+const ALLOC_HELPERS: &str = "// This must be called with mutex_ acquired\n";
+const ALLOC_HELPERS_PATCHED: &str = r#"// Patched in by mlx-sys: without managed memory a host buffer is pinned host
+// memory that kernels read over PCIe, so host buffers get their own cache and
+// a device allocation never reuses one.
+BufferCache<CudaBuffer>& CudaAllocator::cache_for(int device) {
+  return (device == -1 && !supports_managed_memory()) ? host_cache_
+                                                      : buffer_cache_;
+}
+
+// Frees host buffers first. This must be called with mutex_ acquired.
+void CudaAllocator::release_cached(size_t bytes) {
+  size_t host = host_cache_.cache_size();
+  if (host > 0) {
+    host_cache_.release_cached_buffers(std::min(bytes, host));
+  }
+  if (bytes > host) {
+    buffer_cache_.release_cached_buffers(bytes - host);
+  }
+}
+
+// This must be called with mutex_ acquired
+"#;
+
+/// Keep pinned host buffers out of device allocations.
+///
+/// Without managed memory (Windows, WSL and Tegra), MLX moves a buffer the CPU
+/// reads into pinned host memory and later recycles it into a device
+/// allocation of the same size, so the kernels that use it read over PCIe and
+/// a server gets slower with every job. After this patch host and device
+/// buffers have separate caches.
+fn patch_host_cache(dir: &Path) {
+    apply(
+        dir,
+        &[
+            (
+                "mlx/backend/cuda/allocator.h",
+                &[
+                    (ALLOC_H_CACHE, ALLOC_H_CACHE_PATCHED),
+                    (ALLOC_H_HELPERS, ALLOC_H_HELPERS_PATCHED),
+                ],
+            ),
+            (
+                "mlx/backend/cuda/allocator.cpp",
+                &[
+                    (ALLOC_CTOR, ALLOC_CTOR_PATCHED),
+                    (ALLOC_REUSE, ALLOC_REUSE_PATCHED),
+                    (ALLOC_PRESSURE, ALLOC_PRESSURE_PATCHED),
+                    (ALLOC_TRIM, ALLOC_TRIM_PATCHED),
+                    (ALLOC_RECYCLE, ALLOC_RECYCLE_PATCHED),
+                    (ALLOC_CACHE_SIZE, ALLOC_CACHE_SIZE_PATCHED),
+                    (ALLOC_CLEAR, ALLOC_CLEAR_PATCHED),
+                    (ALLOC_HELPERS, ALLOC_HELPERS_PATCHED),
+                ],
+            ),
+        ],
+        "host cache",
+    );
+}
+
 fn build_and_link_mlx_c() {
     // A build script runs on the host, so `cfg!(target_os = ...)` here would
     // describe the host, not the target. The target is only in the environment.
@@ -855,7 +954,7 @@ fn prebuilt_key(cuda: bool, is_msvc: bool) -> String {
         tool_version(Path::new(&env::var("CXX").unwrap_or_else(|_| "c++".into())), "")
     };
     format!(
-        "recipe 5\nmlx-sys {}\nmlx {MLX_TAG}\ntarget {}\ncxx {}\ncuda {cuda}\n\
+        "recipe 6\nmlx-sys {}\nmlx {MLX_TAG}\ntarget {}\ncxx {}\ncuda {cuda}\n\
          nvcc {nvcc}\ncudnn {cudnn}\ncuda-architectures {archs}\n",
         env::var("CARGO_PKG_VERSION").unwrap(),
         env::var("TARGET").unwrap(),

@@ -74,7 +74,9 @@ A first build compiles MLX and CUTLASS from source. Budget forty minutes.
   through v4.7.0 (`cute/stride.hpp:299`, error C3545). `build.rs` renames the
   colliding alias.
 - `build.rs` patches MLX's CUDA backend: a CPU fallback for machines without
-  a CUDA device, and a kernel cache directory per GPU architecture.
+  a CUDA device, a kernel cache directory per GPU architecture, and separate
+  allocator caches for host and device buffers where CUDA has no managed
+  memory (Windows).
 
 ## Upstreaming
 
