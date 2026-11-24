@@ -899,7 +899,7 @@ fn cudnn_version(include: &Path) -> String {
 }
 
 /// Copy the static libraries and the manifest into `out`. On Windows also
-/// OpenBLAS and dlfcn-win32.
+/// OpenBLAS.
 fn export_prebuilt(lib_dir: &Path, build_dir: &Path, out: &Path, key: &str, is_msvc: bool) {
     let lib_out = out.join("lib");
     fs::create_dir_all(&lib_out)
@@ -912,7 +912,7 @@ fn export_prebuilt(lib_dir: &Path, build_dir: &Path, out: &Path, key: &str, is_m
         for name in ["mlx.lib", "mlxc.lib"] {
             copy(&lib_dir.join(name));
         }
-        for name in ["libopenblas.lib", "libopenblas.dll", "dl.lib"] {
+        for name in ["libopenblas.lib", "libopenblas.dll"] {
             let from = find_file(build_dir, name)
                 .unwrap_or_else(|| panic!("mlx-sys: no {name} under {}", build_dir.display()));
             copy(&from);
@@ -954,14 +954,17 @@ fn link_mlx(
         // No libstdc++ to name: MSVC object files carry /DEFAULTLIB directives
         // for the C++ runtime, so link.exe pulls it in by itself.
         //
-        // MLX on Windows downloads a prebuilt OpenBLAS and links it PRIVATE,
-        // and gets dlfcn.h from a vendored dlfcn-win32 that it also links
-        // PRIVATE. A static archive keeps no record of either, so the final
-        // link has to name them itself.
-        // A prebuilt keeps them beside libmlx.
+        // MLX on Windows downloads a prebuilt OpenBLAS and links it PRIVATE.
+        // A static archive keeps no record of that, so the final link has to
+        // name it itself. A prebuilt keeps it beside libmlx.
         let root = build_dir.unwrap_or(lib_dir);
         link_found(root, "libopenblas.lib", "OpenBLAS import library");
-        link_found(root, "dl.lib", "dlfcn-win32");
+        // MLX compiles dlfcn-win32 into itself and links Psapi PRIVATE for it.
+        println!("cargo:rustc-link-lib=dylib=psapi");
+        // mlx/backend/cuda/wddm.cpp reads the GPU memory budget through DXGI.
+        if cuda {
+            println!("cargo:rustc-link-lib=dylib=dxgi");
+        }
         // mlx/backend/cpu/device_info.cpp reads the CPU name out of the
         // registry on Windows (RegOpenKeyExA and friends). CMake gets advapi32
         // from its default platform libraries; cargo's link line has no such
