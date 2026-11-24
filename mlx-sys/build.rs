@@ -97,32 +97,9 @@ fn patched_cutlass(out_dir: &Path) -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Cherry-pick upstream a5a684d into MLX v0.31.2: CUDA RMSNorm computes the
-/// wrong normaliser for a bounded window of row widths.
-///
-/// `rms_norm.cu:298` is the one dispatch arm asking for a 64-thread block
-/// (`group_dim * n_groups` = 32 * 2) and two rows per block at once.
-/// `BlockBroadcastReduce` reduces across the block through a `TempStorage` of
-/// `T[BLOCK_DIM / WARP_SIZE]` = `T[2]`, so two rows' partial sums merge and each
-/// is scaled by `rsqrt((ss(row 2k) + ss(row 2k+1)) / axis_size)`.
-///
-/// Affected window: `n_per_thread * 32 < axis_size <= n_per_thread * 32 * 2`,
-/// with `n_per_thread = N_READS = 16 / sizeof(T)`: widths 129-256 at f32 and
-/// 257-512 at f16.
-///
-/// Fixed upstream in v0.32.0. mlx-c 0.6.0 is the newest tag and pins v0.31.2,
-/// so bumping MLX would mean regenerating this crate's bindings. Patched through
-/// `FETCHCONTENT_SOURCE_DIR_MLX` so it survives `cargo clean`.
-///
-/// Panics rather than falling back: a missing patch is a wrong answer for one
-/// band of shapes, not a compile error. `MLX_SKIP_RMSNORM_PATCH=1` opts out.
-///
-/// The anchors are matched verbatim, indentation included, so an MLX that has
-/// moved fails the build instead of being patched at the wrong line.
-
 /// The MLX this crate builds. Must track the GIT_TAG of the `mlx`
 /// FetchContent_Declare in src/mlx-c/CMakeLists.txt.
-const MLX_TAG: &str = "v0.31.2";
+const MLX_TAG: &str = "v0.32.4";
 
 /// Where a completed build records that every FetchContent dependency is
 /// present in OUT_DIR, so later configures can skip downloading them.
@@ -146,50 +123,24 @@ fn fetchcontent_marker(out_dir: &Path) -> PathBuf {
 /// one it was built on. See where this is used.
 const MACOS_DEPLOYMENT_TARGET: &str = "14.0";
 
-/// rms_norm.cu:298-301 as v0.31.2 ships it.
-const RMS_BROKEN: &str = r#"  } else if (axis_size <= n_per_thread * 32 * 2) {
-    f(std::integral_constant<int, 32>{},
-      std::integral_constant<int, 2>(),
-      std::integral_constant<int, 2>());
-"#;
-
-const RMS_FIXED: &str = r#"  } else if (axis_size <= n_per_thread * 32 * 2) {
-    f(std::integral_constant<int, 32>{},
-      std::integral_constant<int, 2>(),
-      std::integral_constant<int, 1>());
-"#;
-
-/// rms_norm.cu:371, inside `RMSNorm::eval_gpu`.
-const RMS_FWD_ANCHOR: &str = r#"            constexpr int block_dim = n_groups() * group_dim();
-"#;
-
-const RMS_FWD_GUARD: &str = r#"            constexpr int block_dim = n_groups() * group_dim();
-            static_assert(block_dim <= 32 || groups_per_block() == 1);
-"#;
-
-/// rms_norm.cu:481, inside `RMSNormVJP::eval_gpu`. Note the operands are the
-/// other way round there, which is what keeps the two anchors distinct.
-const RMS_VJP_ANCHOR: &str = r#"              constexpr int block_dim = group_dim() * n_groups();
-"#;
-
-const RMS_VJP_GUARD: &str = r#"              constexpr int block_dim = group_dim() * n_groups();
-              static_assert(block_dim <= 32 || groups_per_block() == 1);
-"#;
-
+/// Clone MLX at `MLX_TAG` into OUT_DIR and apply this crate's patches to it.
+///
+/// CMake builds the result through `FETCHCONTENT_SOURCE_DIR_MLX`. The patches
+/// match their anchors verbatim, indentation included, so an MLX that has moved
+/// fails the build instead of being patched at the wrong line.
 fn patched_mlx(out_dir: &Path) -> PathBuf {
-    let dir = out_dir.join("mlx-rmsnorm");
-    let kernel = dir.join("mlx/backend/cuda/rms_norm.cu");
-    if !kernel.exists() {
-        // A directory without the kernel in it is a clone that was interrupted -
-        // and `git clone` refuses a non-empty destination, so a half-finished
-        // one would wedge every later build. Start over instead.
+    let dir = out_dir.join(format!("mlx-{MLX_TAG}"));
+    let probe = dir.join("mlx/backend/cuda/jit_module.cpp");
+    if !probe.exists() {
+        // `git clone` refuses a non-empty destination, so an interrupted clone
+        // would block every later build. Start over instead.
         if dir.exists() {
             fs::remove_dir_all(&dir).unwrap_or_else(|e| {
                 panic!("mlx-sys: clearing the partial MLX clone at {}: {e}", dir.display())
             });
         }
         // core.autocrlf is a per-machine setting and a CRLF checkout would
-        // defeat every anchor above, so pin the line endings for this clone.
+        // defeat every anchor, so pin the line endings for this clone.
         let status = std::process::Command::new("git")
             .args([
                 "-c",
@@ -208,65 +159,40 @@ fn patched_mlx(out_dir: &Path) -> PathBuf {
             .status();
         let cloned = matches!(&status, Ok(s) if s.success());
         assert!(
-            cloned && kernel.exists(),
-            "mlx-sys: could not clone MLX {MLX_TAG} into {} to apply the CUDA \
-             RMSNorm fix (upstream a5a684d). Building against the stock v0.31.2 \
-             would give a library that is numerically wrong for last-axis \
-             widths 129-256 in f32 and 257-512 in f16, so this is a hard stop. \
-             Fix the network or the git on PATH, or set \
-             MLX_SKIP_RMSNORM_PATCH=1 if you genuinely want stock MLX. \
-             git said: {status:?}",
+            cloned && probe.exists(),
+            "mlx-sys: could not clone MLX {MLX_TAG} into {}: {status:?}",
             dir.display()
         );
     }
-
-    let raw = fs::read_to_string(&kernel)
-        .unwrap_or_else(|e| panic!("mlx-sys: reading {}: {e}", kernel.display()));
-    let src = raw.replace("\r\n", "\n");
-
-    // Idempotent: a warm OUT_DIR already holds the patched file.
-    if src.contains(RMS_FIXED) && src.contains(RMS_FWD_GUARD) && src.contains(RMS_VJP_GUARD) {
-        patch_no_device(&dir);
-        return dir;
-    }
-
-    assert_eq!(
-        src.matches(RMS_BROKEN).count(),
-        1,
-        "mlx-sys: {} does not contain the v0.31.2 RMSNorm dispatch arm this \
-         patch is written against. MLX has moved; re-derive the cherry-pick of \
-         a5a684d rather than shipping an unpatched kernel.",
-        kernel.display()
-    );
-    assert_eq!(
-        src.matches(RMS_FWD_ANCHOR).count(),
-        1,
-        "mlx-sys: no unique RMSNorm::eval_gpu block_dim in {}",
-        kernel.display()
-    );
-    assert_eq!(
-        src.matches(RMS_VJP_ANCHOR).count(),
-        1,
-        "mlx-sys: no unique RMSNormVJP::eval_gpu block_dim in {}",
-        kernel.display()
-    );
-
-    let patched = src
-        .replace(RMS_BROKEN, RMS_FIXED)
-        .replace(RMS_FWD_ANCHOR, RMS_FWD_GUARD)
-        .replace(RMS_VJP_ANCHOR, RMS_VJP_GUARD);
-    fs::write(&kernel, &patched)
-        .unwrap_or_else(|e| panic!("mlx-sys: writing {}: {e}", kernel.display()));
-    assert!(
-        patched.contains(RMS_FIXED)
-            && patched.contains(RMS_FWD_GUARD)
-            && patched.contains(RMS_VJP_GUARD),
-        "mlx-sys: the RMSNorm patch did not take in {}",
-        kernel.display()
-    );
-    println!("cargo:warning=mlx-sys: applied CUDA RMSNorm fix (upstream a5a684d) to {}", kernel.display());
     patch_no_device(&dir);
     dir
+}
+
+/// Apply `edits` to each file under `dir`, once: a file that already holds
+/// every replacement is left alone.
+fn apply(dir: &Path, files: &[(&str, &[(&str, &str)])], what: &str) {
+    for (file, edits) in files {
+        let path = dir.join(file);
+        let src = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("mlx-sys: reading {}: {e}", path.display()))
+            .replace("\r\n", "\n");
+        if edits.iter().all(|(_, to)| src.contains(to)) {
+            continue;
+        }
+        let mut out = src;
+        for (from, to) in edits.iter() {
+            assert_eq!(
+                out.matches(from).count(),
+                1,
+                "mlx-sys: no unique anchor for the {what} patch in {}; MLX has moved",
+                path.display()
+            );
+            out = out.replacen(from, to, 1);
+        }
+        fs::write(&path, &out)
+            .unwrap_or_else(|e| panic!("mlx-sys: writing {}: {e}", path.display()));
+        println!("cargo:warning=mlx-sys: applied the {what} patch to {}", path.display());
+    }
 }
 
 /// allocator.cpp: `std::malloc` and `std::free`.
@@ -341,7 +267,22 @@ bool is_available() {
 }
 "#;
 
-/// event.cu: the `Event` behind every stream, CPU streams included.
+/// allocator.cpp: on Windows the limit reads the device's memory pool.
+const ALLOC_WDDM: &str = r#"size_t CudaAllocator::get_memory_limit() {
+#ifdef _WIN32
+"#;
+const ALLOC_WDDM_PATCHED: &str = r#"size_t CudaAllocator::get_memory_limit() {
+  if (!has_cuda_device()) {
+    return memory_limit_;
+  }
+#ifdef _WIN32
+"#;
+
+/// event.h: the `EventImpl` behind every `Event`, CPU streams included.
+const EVENT_H_INCLUDES: &str = "#include <memory>\n";
+const EVENT_H_INCLUDES_PATCHED: &str =
+    "#include <condition_variable>\n#include <memory>\n#include <mutex>\n";
+
 const EVENT_IMPL: &str = r##"  std::unique_ptr<cu::CopyableCudaEvent> cuda;
   std::unique_ptr<cu::AtomicEvent> atomic;
 
@@ -358,6 +299,11 @@ const EVENT_IMPL_PATCHED: &str = r##"  std::unique_ptr<cu::CopyableCudaEvent> cu
     uint64_t value{0};
     std::mutex mtx;
     std::condition_variable cv;
+
+    void wait(uint64_t target) {
+      std::unique_lock lk(mtx);
+      cv.wait(lk, [this, target] { return value >= target; });
+    }
   };
   std::unique_ptr<Host> host;
 
@@ -366,228 +312,123 @@ const EVENT_IMPL_PATCHED: &str = r##"  std::unique_ptr<cu::CopyableCudaEvent> cu
   }
 "##;
 
+/// event.cu
 const EVENT_NEW: &str = r##"Event::Event(Stream s) : stream_(s) {
-  event_ = std::shared_ptr<void>(
-      new EventImpl(), [](void* ptr) { delete static_cast<EventImpl*>(ptr); });
+  event_ = std::make_shared<cu::EventImpl>();
 }
 "##;
 const EVENT_NEW_PATCHED: &str = r##"Event::Event(Stream s) : stream_(s) {
-  auto* impl = new EventImpl();
+  auto impl = std::make_shared<cu::EventImpl>();
   static bool no_device = gpu::device_count() == 0;
   if (no_device) {
-    impl->host = std::make_unique<EventImpl::Host>();
+    impl->host = std::make_unique<cu::EventImpl::Host>();
   }
-  event_ = std::shared_ptr<void>(
-      impl, [](void* ptr) { delete static_cast<EventImpl*>(ptr); });
+  event_ = std::move(impl);
 }
 "##;
 
 const EVENT_WAIT: &str = r##"void Event::wait() {
-  auto* event = static_cast<EventImpl*>(event_.get());
-  assert(event->is_created());
+  check_error();
+  auto& event = cast<cu::EventImpl>();
+  assert(event.is_created());
 "##;
 const EVENT_WAIT_PATCHED: &str = r##"void Event::wait() {
-  auto* event = static_cast<EventImpl*>(event_.get());
-  assert(event->is_created());
-  if (auto* host = event->host.get()) {
-    auto target = value();
-    std::unique_lock lk(host->mtx);
-    host->cv.wait(lk, [host, target] { return host->value >= target; });
+  check_error();
+  auto& event = cast<cu::EventImpl>();
+  assert(event.is_created());
+  if (event.host) {
+    event.host->wait(value());
+    check_error();
     return;
   }
 "##;
 
 const EVENT_WAIT_STREAM: &str = r##"void Event::wait(Stream s) {
-  auto* event = static_cast<EventImpl*>(event_.get());
-  assert(event->is_created());
+  auto& event = cast<cu::EventImpl>();
+  assert(event.is_created());
 "##;
 const EVENT_WAIT_STREAM_PATCHED: &str = r##"void Event::wait(Stream s) {
-  auto* event = static_cast<EventImpl*>(event_.get());
-  assert(event->is_created());
-  if (event->host) {
-    scheduler::enqueue(s, [*this]() mutable { wait(); });
+  auto& event = cast<cu::EventImpl>();
+  assert(event.is_created());
+  if (event.host) {
+    scheduler::wait_event(s, *this, [value = value()](Event& self) {
+      self.cast<cu::EventImpl>().host->wait(value);
+    });
     return;
   }
 "##;
 
 const EVENT_SIGNAL: &str = r##"void Event::signal(Stream s) {
-  auto* event = static_cast<EventImpl*>(event_.get());
-  event->ensure_created(s, value());
+  auto& event = cast<cu::EventImpl>();
+  event.ensure_created(s, value());
 "##;
 const EVENT_SIGNAL_PATCHED: &str = r##"void Event::signal(Stream s) {
-  auto* event = static_cast<EventImpl*>(event_.get());
-  if (event->host) {
-    scheduler::enqueue(s, [*this]() mutable {
-      auto* host = static_cast<EventImpl*>(event_.get())->host.get();
+  auto& event = cast<cu::EventImpl>();
+  if (event.host) {
+    scheduler::signal_event(s, *this, [value = value()](Event& self) {
+      auto& host = *self.cast<cu::EventImpl>().host;
       {
-        std::lock_guard lk(host->mtx);
-        host->value = value();
+        std::lock_guard lk(host.mtx);
+        host.value = value;
       }
-      host->cv.notify_all();
+      host.cv.notify_all();
     });
     return;
   }
-  event->ensure_created(s, value());
+  event.ensure_created(s, value());
 "##;
 
 const EVENT_SIGNALED: &str = r##"bool Event::is_signaled() const {
-  auto* event = static_cast<EventImpl*>(event_.get());
+  auto& event = cast<cu::EventImpl>();
 "##;
 const EVENT_SIGNALED_PATCHED: &str = r##"bool Event::is_signaled() const {
-  auto* event = static_cast<EventImpl*>(event_.get());
-  if (auto* host = event->host.get()) {
-    std::lock_guard lk(host->mtx);
-    return host->value >= value();
+  auto& event = cast<cu::EventImpl>();
+  if (event.host) {
+    std::lock_guard lk(event.host->mtx);
+    return event.host->value >= value();
   }
 "##;
-
-const EVENT_INCLUDES: &str = "#include <map>\n#include <vector>\n";
-const EVENT_INCLUDES_PATCHED: &str =
-    "#include <condition_variable>\n#include <map>\n#include <mutex>\n#include <vector>\n";
-
-/// fence.cpp: the cross-stream `Fence` used by `eval`.
-const FENCE: &str = r##"#include "mlx/backend/cuda/event.h"
-
-namespace mlx::core {
-
-struct FenceImpl {
-  uint32_t count;
-  cu::AtomicEvent event;
-};
-
-Fence::Fence(Stream s) {
-  fence_ = std::shared_ptr<void>(
-      new FenceImpl{0, cu::device(s.device)},
-      [](void* ptr) { delete static_cast<FenceImpl*>(ptr); });
-}
-
-void Fence::wait(Stream s, const array&) {
-  auto* fence = static_cast<FenceImpl*>(fence_.get());
-  fence->event.wait(fence->count);
-}
-
-void Fence::update(Stream s, const array& a, bool cross_device) {
-  auto* fence = static_cast<FenceImpl*>(fence_.get());
-"##;
-const FENCE_PATCHED: &str = r##"#include "mlx/backend/cuda/event.h"
-#include "mlx/backend/gpu/device_info.h"
-#include "mlx/scheduler.h"
-
-#include <condition_variable>
-#include <mutex>
-#include <optional>
-
-namespace mlx::core {
-
-struct FenceImpl {
-  uint32_t count;
-  std::optional<cu::AtomicEvent> event;
-  // Patched in by mlx-sys: without a CUDA device, a host counter like the
-  // CPU-only build's.
-  uint32_t value{0};
-  std::mutex mtx;
-  std::condition_variable cv;
-};
-
-Fence::Fence(Stream s) {
-  auto* impl = new FenceImpl{0};
-  if (gpu::device_count() > 0) {
-    impl->event.emplace(cu::device(s.device));
-  }
-  fence_ = std::shared_ptr<void>(
-      impl, [](void* ptr) { delete static_cast<FenceImpl*>(ptr); });
-}
-
-void Fence::wait(Stream s, const array&) {
-  auto* fence = static_cast<FenceImpl*>(fence_.get());
-  if (!fence->event) {
-    scheduler::enqueue(s, [count = fence->count, fence_ = fence_]() {
-      auto& f = *static_cast<FenceImpl*>(fence_.get());
-      std::unique_lock lk(f.mtx);
-      f.cv.wait(lk, [&f, count] { return f.value >= count; });
-    });
-    return;
-  }
-  fence->event->wait(fence->count);
-}
-
-void Fence::update(Stream s, const array& a, bool cross_device) {
-  auto* fence = static_cast<FenceImpl*>(fence_.get());
-  if (!fence->event) {
-    fence->count++;
-    scheduler::enqueue(s, [count = fence->count, fence_ = fence_]() {
-      auto& f = *static_cast<FenceImpl*>(fence_.get());
-      {
-        std::lock_guard lk(f.mtx);
-        f.value = count;
-      }
-      f.cv.notify_all();
-    });
-    return;
-  }
-"##;
-
-const FENCE_SIGNAL: &str = "  fence->event.signal(s, fence->count);\n";
-const FENCE_SIGNAL_PATCHED: &str = "  fence->event->signal(s, fence->count);\n";
 
 /// Let a CUDA build of MLX run on the CPU of a machine without a CUDA device.
 ///
 /// A CUDA build serves CPU arrays and CPU streams through CUDA too: the
-/// allocator calls `cudaMemGetInfo` and `cudaMallocManaged`, and every `Event`
-/// and `Fence` is built on device 0. Without a device each of these fails.
-/// After this patch `gpu::is_available()` answers whether a device exists,
-/// which makes the CPU MLX's default device, and in that case the allocator
-/// uses `malloc` and events and fences use the CPU-only build's host counter.
-///
-/// Anchors are matched verbatim, like the RMSNorm ones.
+/// allocator calls `cudaMemGetInfo` and `cudaMallocManaged`, and every `Event`,
+/// the ones inside a `Fence` included, is built on device 0. Without a device
+/// each of these fails. After this patch `gpu::is_available()` answers whether
+/// a device exists, which makes the CPU MLX's default device, and in that case
+/// the allocator uses `malloc` and events use the CPU-only build's host counter.
 fn patch_no_device(dir: &Path) {
-    let files: [(&str, &[(&str, &str)]); 4] = [
-        (
-            "mlx/backend/cuda/allocator.cpp",
-            &[
-                (ALLOC_INCLUDE, ALLOC_INCLUDE_PATCHED),
-                (ALLOC_MALLOC, ALLOC_MALLOC_PATCHED),
-                (ALLOC_FREE, ALLOC_FREE_PATCHED),
-                (ALLOC_LIMITS, ALLOC_LIMITS_PATCHED),
-            ],
-        ),
-        ("mlx/backend/cuda/device_info.cpp", &[(GPU_AVAILABLE, GPU_AVAILABLE_PATCHED)]),
-        (
-            "mlx/backend/cuda/event.cu",
-            &[
-                (EVENT_INCLUDES, EVENT_INCLUDES_PATCHED),
-                (EVENT_IMPL, EVENT_IMPL_PATCHED),
-                (EVENT_NEW, EVENT_NEW_PATCHED),
-                (EVENT_WAIT, EVENT_WAIT_PATCHED),
-                (EVENT_WAIT_STREAM, EVENT_WAIT_STREAM_PATCHED),
-                (EVENT_SIGNAL, EVENT_SIGNAL_PATCHED),
-                (EVENT_SIGNALED, EVENT_SIGNALED_PATCHED),
-            ],
-        ),
-        ("mlx/backend/cuda/fence.cpp", &[(FENCE, FENCE_PATCHED), (FENCE_SIGNAL, FENCE_SIGNAL_PATCHED)]),
-    ];
-    for (file, edits) in files {
-        let path = dir.join(file);
-        let src = fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("mlx-sys: reading {}: {e}", path.display()))
-            .replace("\r\n", "\n");
-        if edits.iter().all(|(_, to)| src.contains(to)) {
-            continue;
-        }
-        let mut out = src;
-        for (from, to) in edits {
-            assert_eq!(
-                out.matches(from).count(),
-                1,
-                "mlx-sys: no unique anchor for the no-device patch in {}; MLX has moved",
-                path.display()
-            );
-            out = out.replacen(from, to, 1);
-        }
-        fs::write(&path, &out)
-            .unwrap_or_else(|e| panic!("mlx-sys: writing {}: {e}", path.display()));
-        println!("cargo:warning=mlx-sys: applied the no-device CPU fallback to {}", path.display());
-    }
+    apply(
+        dir,
+        &[
+            (
+                "mlx/backend/cuda/allocator.cpp",
+                &[
+                    (ALLOC_INCLUDE, ALLOC_INCLUDE_PATCHED),
+                    (ALLOC_MALLOC, ALLOC_MALLOC_PATCHED),
+                    (ALLOC_FREE, ALLOC_FREE_PATCHED),
+                    (ALLOC_LIMITS, ALLOC_LIMITS_PATCHED),
+                    (ALLOC_WDDM, ALLOC_WDDM_PATCHED),
+                ],
+            ),
+            ("mlx/backend/cuda/device_info.cpp", &[(GPU_AVAILABLE, GPU_AVAILABLE_PATCHED)]),
+            (
+                "mlx/backend/cuda/event.h",
+                &[(EVENT_H_INCLUDES, EVENT_H_INCLUDES_PATCHED), (EVENT_IMPL, EVENT_IMPL_PATCHED)],
+            ),
+            (
+                "mlx/backend/cuda/event.cu",
+                &[
+                    (EVENT_NEW, EVENT_NEW_PATCHED),
+                    (EVENT_WAIT, EVENT_WAIT_PATCHED),
+                    (EVENT_WAIT_STREAM, EVENT_WAIT_STREAM_PATCHED),
+                    (EVENT_SIGNAL, EVENT_SIGNAL_PATCHED),
+                    (EVENT_SIGNALED, EVENT_SIGNALED_PATCHED),
+                ],
+            ),
+        ],
+        "no-device CPU fallback",
+    );
 }
 
 fn build_and_link_mlx_c() {
@@ -622,7 +463,6 @@ fn build_and_link_mlx_c() {
         "MLX_PREBUILT_DIR",
         "MLX_PREBUILT_OUT",
         "MLX_CUDA_ARCHITECTURES",
-        "MLX_SKIP_RMSNORM_PATCH",
         "CUDA_PATH",
         "CUDNN_PATH",
         "CXX",
@@ -722,23 +562,9 @@ fn build_and_link_mlx_c() {
     config.define("MLX_BUILD_ACCELERATE", if accelerate { "ON" } else { "OFF" });
     config.define("MLX_BUILD_CUDA", if cuda { "ON" } else { "OFF" });
     if cuda {
-        // Cherry-pick of upstream a5a684d onto the pinned v0.31.2. Every CUDA
-        // build, not just MSVC: the bug is in the kernel, not the toolchain.
-        // See `patched_mlx` for what it is and why it is not a version bump.
-        if env::var_os("MLX_SKIP_RMSNORM_PATCH").is_none() {
-            let dir = patched_mlx(&PathBuf::from(env::var("OUT_DIR").unwrap()));
-            config.define("FETCHCONTENT_SOURCE_DIR_MLX", &dir);
-            println!(
-                "cargo:warning=mlx-sys: using RMSNorm-patched MLX at {}",
-                dir.display()
-            );
-        } else {
-            println!(
-                "cargo:warning=mlx-sys: MLX_SKIP_RMSNORM_PATCH is set - building STOCK MLX \
-                 v0.31.2, whose CUDA RMSNorm returns the wrong normaliser for last-axis \
-                 widths 129-256 (f32) and 257-512 (f16)"
-            );
-        }
+        let dir = patched_mlx(&PathBuf::from(env::var("OUT_DIR").unwrap()));
+        config.define("FETCHCONTENT_SOURCE_DIR_MLX", &dir);
+        println!("cargo:warning=mlx-sys: using patched MLX at {}", dir.display());
         // MLX's FindCUDNN.cmake only looks in the CUDA toolkit and in
         // C:/Program Files/NVIDIA/CUDNN/*. Point it at CUDNN_PATH instead; the
         // suffixes it appends are `include` and `lib/x64`, so CUDNN_PATH is the
@@ -829,7 +655,6 @@ fn prebuilt_key(cuda: bool, is_msvc: bool) -> String {
     } else {
         Default::default()
     };
-    let rmsnorm = cuda && env::var_os("MLX_SKIP_RMSNORM_PATCH").is_none();
     // MSVC 14.x toolsets link libraries built by an older 14.x, and hosted
     // runners update theirs every month, so only the family is recorded.
     let cxx = if is_msvc {
@@ -838,8 +663,8 @@ fn prebuilt_key(cuda: bool, is_msvc: bool) -> String {
         tool_version(Path::new(&env::var("CXX").unwrap_or_else(|_| "c++".into())), "")
     };
     format!(
-        "recipe 4\nmlx-sys {}\nmlx {MLX_TAG}\ntarget {}\ncxx {}\ncuda {cuda}\n\
-         nvcc {nvcc}\ncudnn {cudnn}\ncuda-architectures {archs}\nrmsnorm-patch {rmsnorm}\n",
+        "recipe 5\nmlx-sys {}\nmlx {MLX_TAG}\ntarget {}\ncxx {}\ncuda {cuda}\n\
+         nvcc {nvcc}\ncudnn {cudnn}\ncuda-architectures {archs}\n",
         env::var("CARGO_PKG_VERSION").unwrap(),
         env::var("TARGET").unwrap(),
         cxx,

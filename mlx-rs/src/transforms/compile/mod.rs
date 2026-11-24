@@ -175,8 +175,18 @@ pub fn disable_compile() {
 
 /// Clear the memory cache.
 pub fn clear_cache() {
+    with_compile_cache(|cache| unsafe {
+        mlx_sys::mlx_detail_compile_clear_cache(cache);
+    });
+}
+
+/// Run `f` on a handle to MLX's compile cache.
+fn with_compile_cache(f: impl FnOnce(mlx_sys::mlx_compile_cache)) {
     unsafe {
-        mlx_sys::mlx_detail_compile_clear_cache();
+        let mut cache = mlx_sys::mlx_compile_cache_new();
+        mlx_sys::mlx_detail_compile_cache(&mut cache);
+        f(cache);
+        mlx_sys::mlx_compile_cache_free(cache);
     }
 }
 
@@ -196,10 +206,10 @@ struct CompiledState<F> {
 
 impl<F> Drop for CompiledState<F> {
     fn drop(&mut self) {
-        unsafe {
-            // remove the compiled structure from the back end
-            mlx_sys::mlx_detail_compile_erase(self.id);
-        }
+        // remove the compiled structure from the back end
+        with_compile_cache(|cache| unsafe {
+            mlx_sys::mlx_detail_compile_erase(cache, self.id);
+        });
     }
 }
 

@@ -39,11 +39,11 @@ Six commits, each one change, each checkable against a published source.
 | | |
 |---|---|
 | Import as published | byte for byte from crates.io |
-| Take mlx-c from upstream `fba4470` | the bundled copy predates the CUDA backend |
+| Take mlx-c from upstream `v0.8.0` | the bundled copy predates the CUDA backend; v0.8.0 builds MLX v0.32.4 |
 | Half types on x86 | mlx-c declares `float16_t`/`bfloat16_t` on aarch64 only |
 | Array entry points | the newer mlx-c moved the API out from under 0.25.3's bindings |
 | mlx-rs to suit | five files of signature work |
-| Build off Apple | one `build.rs` for macOS, MSVC and Linux; patches CUTLASS and MLX's RMSNorm at configure time |
+| Build off Apple | one `build.rs` for macOS, MSVC and Linux; patches CUTLASS and MLX's CUDA backend at configure time |
 
 ## Use
 
@@ -69,12 +69,12 @@ A first build compiles MLX and CUTLASS from source. Budget forty minutes.
 ## Known limitations
 
 - `ScaledDotProductAttentionMask::Arrays(masks)` degrades to `masks.first()`.
-  mlx-c 0.6.0 takes a single mask; the variant can no longer be expressed.
+  mlx-c takes a single mask since 0.6.0; the variant can no longer be expressed.
 - CUTLASS does not compile under MSVC 19.44 at any released version, v4.4.2
   through v4.7.0 (`cute/stride.hpp:299`, error C3545). `build.rs` renames the
   colliding alias.
-- The RMSNorm cherry-pick is upstream in v0.32.0 and is carried only until the
-  pinned MLX moves past it.
+- `build.rs` patches MLX's CUDA backend with a CPU fallback for machines
+  without a CUDA device.
 
 ## Upstreaming
 

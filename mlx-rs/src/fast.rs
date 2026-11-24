@@ -143,6 +143,8 @@ pub fn scaled_dot_product_attention_device<'a>(
             mask_arr,
             // `sinks`, new in mlx-c 0.6.0: attention sinks, absent here.
             null_array(),
+            // `force_fused`, new in mlx-c 0.8.0.
+            false,
             stream.as_ref().as_ptr(),
         )
     })

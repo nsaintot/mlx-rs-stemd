@@ -3,6 +3,14 @@ use crate::utils::guard::Guarded;
 use crate::{Array, Stream};
 use mlx_internal_macros::{default_device, generate_macro};
 
+/// No dtype conversion of the input.
+fn no_dtype() -> mlx_sys::mlx_optional_dtype {
+    mlx_sys::mlx_optional_dtype {
+        value: 0,
+        has_value: false,
+    }
+}
+
 impl Array {
     /// Return the cumulative maximum of the elements along the given axis returning an error if the inputs are invalid.
     ///
@@ -33,7 +41,7 @@ impl Array {
 
         match axis.into() {
             Some(axis) => Array::try_from_op(|res| unsafe {
-                mlx_sys::mlx_cummax(
+                mlx_sys::mlx_cummax_axis(
                     res,
                     self.as_ptr(),
                     axis,
@@ -46,7 +54,7 @@ impl Array {
                 let shape = &[-1];
                 let flat = self.reshape_device(shape, stream)?;
                 Array::try_from_op(|res| unsafe {
-                    mlx_sys::mlx_cummax(
+                    mlx_sys::mlx_cummax_axis(
                         res,
                         flat.as_ptr(),
                         0,
@@ -88,7 +96,7 @@ impl Array {
 
         match axis.into() {
             Some(axis) => Array::try_from_op(|res| unsafe {
-                mlx_sys::mlx_cummin(
+                mlx_sys::mlx_cummin_axis(
                     res,
                     self.as_ptr(),
                     axis,
@@ -101,7 +109,7 @@ impl Array {
                 let shape = &[-1];
                 let flat = self.reshape_device(shape, stream)?;
                 Array::try_from_op(|res| unsafe {
-                    mlx_sys::mlx_cummin(
+                    mlx_sys::mlx_cummin_axis(
                         res,
                         flat.as_ptr(),
                         0,
@@ -143,12 +151,13 @@ impl Array {
 
         match axis.into() {
             Some(axis) => Array::try_from_op(|res| unsafe {
-                mlx_sys::mlx_cumprod(
+                mlx_sys::mlx_cumprod_axis(
                     res,
                     self.as_ptr(),
                     axis,
                     reverse.into().unwrap_or(false),
                     inclusive.into().unwrap_or(true),
+                    no_dtype(),
                     stream.as_ptr(),
                 )
             }),
@@ -156,12 +165,13 @@ impl Array {
                 let shape = &[-1];
                 let flat = self.reshape_device(shape, stream)?;
                 Array::try_from_op(|res| unsafe {
-                    mlx_sys::mlx_cumprod(
+                    mlx_sys::mlx_cumprod_axis(
                         res,
                         flat.as_ptr(),
                         0,
                         reverse.into().unwrap_or(false),
                         inclusive.into().unwrap_or(true),
+                        no_dtype(),
                         stream.as_ptr(),
                     )
                 })
@@ -198,12 +208,13 @@ impl Array {
 
         match axis.into() {
             Some(axis) => Array::try_from_op(|res| unsafe {
-                mlx_sys::mlx_cumsum(
+                mlx_sys::mlx_cumsum_axis(
                     res,
                     self.as_ptr(),
                     axis,
                     reverse.into().unwrap_or(false),
                     inclusive.into().unwrap_or(true),
+                    no_dtype(),
                     stream.as_ptr(),
                 )
             }),
@@ -211,12 +222,13 @@ impl Array {
                 let shape = &[-1];
                 let flat = self.reshape_device(shape, stream)?;
                 Array::try_from_op(|res| unsafe {
-                    mlx_sys::mlx_cumsum(
+                    mlx_sys::mlx_cumsum_axis(
                         res,
                         flat.as_ptr(),
                         0,
                         reverse.into().unwrap_or(false),
                         inclusive.into().unwrap_or(true),
+                        no_dtype(),
                         stream.as_ptr(),
                     )
                 })
