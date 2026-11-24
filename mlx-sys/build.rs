@@ -166,6 +166,7 @@ fn patched_mlx(out_dir: &Path) -> PathBuf {
     }
     patch_no_device(&dir);
     patch_no_cusolver(&dir);
+    patch_tma_on_windows(&dir);
     patch_ptx_cache(&dir);
     dir
 }
@@ -472,6 +473,93 @@ fn patch_no_cusolver(dir: &Path) {
             ("mlx/backend/cuda/primitives.cpp", &[(SOLVER_NO_GPU, SOLVER_NO_GPU_PATCHED)]),
         ],
         "no-cuSOLVER",
+    );
+}
+
+/// fp_quantize.cuh: the MXFP8 columnwise kernel takes two `CUtensorMap`s by value.
+const TMA_KERNEL: &str = r#"template <
+    typename T,
+    bool USE_SR,
+    int THREADS_PER_BLOCK,
+    int COLS_PER_BLOCK,
+    int ROWS_PER_BLOCK>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK)
+    fp_quantize_columnwise_mxfp8(
+"#;
+const TMA_KERNEL_PATCHED: &str = r#"// Patched in by mlx-sys: MSVC cannot pass the over-aligned CUtensorMap by
+// value, so Windows builds use the fallback kernel.
+#if !defined(_WIN32)
+template <
+    typename T,
+    bool USE_SR,
+    int THREADS_PER_BLOCK,
+    int COLS_PER_BLOCK,
+    int ROWS_PER_BLOCK>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK)
+    fp_quantize_columnwise_mxfp8(
+"#;
+const TMA_KERNEL_END: &str = r#"#endif // defined(CUTE_ARCH_TMA_SM90_ENABLED)
+}
+
+// TODO: add kernel with tma instructions
+"#;
+const TMA_KERNEL_END_PATCHED: &str = r#"#endif // defined(CUTE_ARCH_TMA_SM90_ENABLED)
+}
+#endif // !defined(_WIN32)
+
+// TODO: add kernel with tma instructions
+"#;
+
+/// fp_quantize.cu: the host function that launches it, and its one caller.
+const TMA_HOST: &str = "}\n\nvoid fp_quantize_columnwise_mxfp8(\n";
+const TMA_HOST_PATCHED: &str = "}\n\n#if !defined(_WIN32)\nvoid fp_quantize_columnwise_mxfp8(\n";
+const TMA_HOST_END: &str = "}\n\nvoid fp_quantize_columnwise(\n";
+const TMA_HOST_END_PATCHED: &str = "}\n#endif // !defined(_WIN32)\n\nvoid fp_quantize_columnwise(\n";
+const TMA_CALL: &str = r#"  if (use_tma) {
+    fp_quantize_columnwise_mxfp8(
+        w, wq, scales, group_size, bits, global_scale, enc, s);
+  } else {
+    fp_quantize_columnwise_fallback(
+        w, wq, scales, group_size, bits, global_scale, enc, s);
+  }
+"#;
+const TMA_CALL_PATCHED: &str = r#"#if !defined(_WIN32)
+  if (use_tma) {
+    fp_quantize_columnwise_mxfp8(
+        w, wq, scales, group_size, bits, global_scale, enc, s);
+    return;
+  }
+#else
+  (void)use_tma;
+#endif
+  fp_quantize_columnwise_fallback(
+      w, wq, scales, group_size, bits, global_scale, enc, s);
+"#;
+
+/// Leave the TMA quantize kernel out of Windows builds.
+///
+/// MSVC rejects a kernel parameter of over-aligned type passed by value
+/// (`error C2719`), and the MXFP8 columnwise quantize kernel takes two
+/// `CUtensorMap`s that way. Windows uses the fallback kernel, which MLX already
+/// runs below compute capability 10.
+fn patch_tma_on_windows(dir: &Path) {
+    apply(
+        dir,
+        &[
+            (
+                "mlx/backend/cuda/quantized/fp_quantize.cuh",
+                &[(TMA_KERNEL, TMA_KERNEL_PATCHED), (TMA_KERNEL_END, TMA_KERNEL_END_PATCHED)],
+            ),
+            (
+                "mlx/backend/cuda/quantized/fp_quantize.cu",
+                &[
+                    (TMA_HOST, TMA_HOST_PATCHED),
+                    (TMA_HOST_END, TMA_HOST_END_PATCHED),
+                    (TMA_CALL, TMA_CALL_PATCHED),
+                ],
+            ),
+        ],
+        "Windows TMA",
     );
 }
 
