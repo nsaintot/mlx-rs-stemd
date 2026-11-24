@@ -165,19 +165,28 @@ fn patched_mlx(out_dir: &Path) -> PathBuf {
         );
     }
     patch_no_device(&dir);
+    patch_no_cusolver(&dir);
     patch_ptx_cache(&dir);
     dir
 }
 
 /// Apply `edits` to each file under `dir`, once: a file that already holds
-/// every replacement is left alone.
+/// every replacement, and none of the text an empty replacement deletes, is
+/// left alone.
 fn apply(dir: &Path, files: &[(&str, &[(&str, &str)])], what: &str) {
     for (file, edits) in files {
         let path = dir.join(file);
         let src = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("mlx-sys: reading {}: {e}", path.display()))
             .replace("\r\n", "\n");
-        if edits.iter().all(|(_, to)| src.contains(to)) {
+        let done = |(from, to): &(&str, &str)| {
+            if to.is_empty() {
+                !src.contains(from)
+            } else {
+                src.contains(to)
+            }
+        };
+        if edits.iter().all(done) {
             continue;
         }
         let mut out = src;
@@ -429,6 +438,40 @@ fn patch_no_device(dir: &Path) {
             ),
         ],
         "no-device CPU fallback",
+    );
+}
+
+/// mlx/backend/cuda/CMakeLists.txt: the cuSOLVER sources and library.
+const SOLVER_CHOLESKY: &str = "          ${CMAKE_CURRENT_SOURCE_DIR}/cholesky.cu\n";
+const SOLVER_UTILS: &str = "          ${CMAKE_CURRENT_SOURCE_DIR}/cusolver_utils.cpp\n";
+const SOLVER_LINK: &str = "# Use cuSOLVER.\ntarget_link_libraries(mlx PRIVATE CUDA::cusolver)\n";
+
+/// eval.cpp
+const SOLVER_INCLUDE: &str = "#include \"mlx/backend/cuda/cusolver_utils.h\"\n";
+const SOLVER_INIT: &str = "  init_cusolver_handles_cache();\n";
+
+/// primitives.cpp: the CPU-fallback list of linear algebra primitives.
+const SOLVER_NO_GPU: &str = "NO_GPU(Inverse)\n";
+const SOLVER_NO_GPU_PATCHED: &str = "NO_GPU(Cholesky)\nNO_GPU(Inverse)\n";
+
+/// Leave cuSOLVER out of MLX.
+///
+/// MLX uses cuSOLVER for its GPU Cholesky alone. Linking it means shipping
+/// libcusolver and the libcusparse it loads, about 340 MB, for an operation
+/// stemd never runs. After this patch Cholesky runs on the CPU, as it does in
+/// MLX v0.31.
+fn patch_no_cusolver(dir: &Path) {
+    apply(
+        dir,
+        &[
+            (
+                "mlx/backend/cuda/CMakeLists.txt",
+                &[(SOLVER_CHOLESKY, ""), (SOLVER_UTILS, ""), (SOLVER_LINK, "")],
+            ),
+            ("mlx/backend/cuda/eval.cpp", &[(SOLVER_INCLUDE, ""), (SOLVER_INIT, "")]),
+            ("mlx/backend/cuda/primitives.cpp", &[(SOLVER_NO_GPU, SOLVER_NO_GPU_PATCHED)]),
+        ],
+        "no-cuSOLVER",
     );
 }
 
