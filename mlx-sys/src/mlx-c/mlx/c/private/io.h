@@ -3,6 +3,9 @@
 
 #include <iostream>
 #include <streambuf>
+// Messages are built with std::to_string: GCC 11, which builds the Linux
+// packages, has no std::format.
+#include <string>
 
 #include "mlx/mlx.h"
 
@@ -48,14 +51,16 @@ class CReader : public mlx::core::io::Reader {
     auto read_n = vtable.read(desc, data, n);
     if (read_n != n) {
       reader_error(
-          std::format("unable to read {} bytes (read {} instead)", n, read_n));
+          "unable to read " + std::to_string(n) + " bytes (read " +
+          std::to_string(read_n) + " instead)");
     }
   };
   virtual void read(char* data, size_t n, size_t offset) override {
     auto read_n = vtable.read_at_offset(desc, data, n, offset);
     if (read_n != n) {
       reader_error(
-          std::format("unable to read {} bytes (read {} instead)", n, read_n));
+          "unable to read " + std::to_string(n) + " bytes (read " +
+          std::to_string(read_n) + " instead)");
     }
   };
   virtual std::string label() const override {
@@ -63,7 +68,7 @@ class CReader : public mlx::core::io::Reader {
   };
   void reader_error(const std::string& msg) {
     throw std::runtime_error(
-        std::format("[mlx_io_reader] {} in {}", msg, label()));
+        "[mlx_io_reader] " + msg + " in " + label());
   }
   virtual ~CReader() {
     vtable.free(desc);
@@ -110,8 +115,8 @@ class CWriter : public mlx::core::io::Writer {
     auto wrote_n = vtable.write(desc, data, n);
     if (wrote_n != n) {
       writer_error(
-          std::format(
-              "unable to write {} bytes (wrote {} instead)", n, wrote_n));
+          "unable to write " + std::to_string(n) + " bytes (wrote " +
+          std::to_string(wrote_n) + " instead)");
     }
   };
   virtual std::string label() const override {
@@ -119,7 +124,7 @@ class CWriter : public mlx::core::io::Writer {
   };
   void writer_error(const std::string& msg) {
     throw std::runtime_error(
-        std::format("[mlx_io_writer] {} in {}", msg, label()));
+        "[mlx_io_writer] " + msg + " in " + label());
   }
   virtual ~CWriter() {
     vtable.free(desc);
