@@ -8,6 +8,25 @@
 #include "mlx/c/private/mlx.h"
 #include "mlx/fast.h"
 
+extern "C" int mlx_fast_cross_entropy(
+    mlx_array* res,
+    const mlx_array logits,
+    const mlx_array targets,
+    const mlx_stream s) {
+  try {
+    mlx_array_set_(
+        *res,
+        mlx::core::fast::cross_entropy(
+            mlx_array_get_(logits),
+            mlx_array_get_(targets),
+            mlx_stream_get_(s)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+
 struct mlx_fast_cuda_kernel_config_cpp_ {
   std::vector<mlx::core::Shape> output_shapes;
   std::vector<mlx::core::Dtype> output_dtypes;
@@ -251,6 +270,37 @@ extern "C" int mlx_fast_cuda_kernel_apply(
   return 0;
 }
 
+extern "C" int mlx_fast_gated_delta_update(
+    mlx_vector_array* res,
+    const mlx_array queries,
+    const mlx_array keys,
+    const mlx_array values,
+    const mlx_array gates,
+    const mlx_array beta_,
+    const mlx_array initial_state /* may be null */,
+    const mlx_array mask /* may be null */,
+    const mlx_stream s) {
+  try {
+    mlx_vector_array_set_(
+        *res,
+        mlx::core::fast::gated_delta_update(
+            mlx_array_get_(queries),
+            mlx_array_get_(keys),
+            mlx_array_get_(values),
+            mlx_array_get_(gates),
+            mlx_array_get_(beta_),
+            (initial_state.ctx
+                 ? std::make_optional(mlx_array_get_(initial_state))
+                 : std::nullopt),
+            (mask.ctx ? std::make_optional(mlx_array_get_(mask))
+                      : std::nullopt),
+            mlx_stream_get_(s)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
 extern "C" int mlx_fast_layer_norm(
     mlx_array* res,
     const mlx_array x,
@@ -610,6 +660,7 @@ extern "C" int mlx_fast_scaled_dot_product_attention(
     const char* mask_mode,
     const mlx_array mask_arr /* may be null */,
     const mlx_array sinks /* may be null */,
+    bool force_fused,
     const mlx_stream s) {
   try {
     mlx_array_set_(
@@ -624,6 +675,7 @@ extern "C" int mlx_fast_scaled_dot_product_attention(
                           : std::nullopt),
             (sinks.ctx ? std::make_optional(mlx_array_get_(sinks))
                        : std::nullopt),
+            force_fused,
             mlx_stream_get_(s)));
   } catch (std::exception& e) {
     mlx_error(e.what());
